@@ -1,13 +1,6 @@
 #ifndef DASHBOARD_H
 #define DASHBOARD_H
 
-// The dashboard is served by main.cpp over HTTP on port 80.
-// It uses Server-Sent Events (/api/events) for push notifications —
-// the browser never needs to poll; the server pushes every 400 ms.
-// An alert log panel records every anomaly event with timestamp.
-// A browser Notification API request is made on first load so the
-// user can receive OS-level push alerts even when the tab is in the background.
-
 const char* html_page = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -149,12 +142,10 @@ const char* html_page = R"rawliteral(
 
   <div class="max-w-7xl mx-auto space-y-4">
 
-    <!-- ── Header ────────────────────────────────────────────────────────── -->
     <div class="panel p-4 flex flex-col sm:flex-row justify-between items-center gap-3">
       <div class="flex items-center gap-3">
         <div class="w-10 h-10 rounded-full flex items-center justify-center"
              style="background:rgba(34,211,238,0.1);border:1px solid rgba(34,211,238,0.4);box-shadow:0 0 16px rgba(34,211,238,0.3)">
-          <!-- wave icon -->
           <svg class="w-5 h-5" style="color:var(--c-cyan)" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M3 12c1.5-3 3-3 4.5 0s3 3 4.5 0 3-3 4.5 0 3 3 4.5 0"/>
@@ -162,7 +153,7 @@ const char* html_page = R"rawliteral(
         </div>
         <div>
           <h1 class="mono text-xl font-bold text-white">FLOAT <span class="glow-cyan">SYSTEM</span></h1>
-          <p class="text-xs" style="color:var(--c-muted)">Autonomous Aquarium Edge-Control · v2</p>
+          <p class="text-xs" style="color:var(--c-muted)">Industrial Pump Diagnostics · v2.1</p>
         </div>
       </div>
       <div class="flex gap-2 items-center flex-wrap justify-center">
@@ -173,7 +164,6 @@ const char* html_page = R"rawliteral(
       </div>
     </div>
 
-    <!-- ── Alert banner (shown only when HALTED) ─────────────────────────── -->
     <div id="alert-banner" style="display:none" class="p-3 flex justify-between items-center gap-3">
       <div class="flex items-center gap-2">
         <svg class="w-5 h-5 shrink-0" style="color:var(--c-red)" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -186,10 +176,8 @@ const char* html_page = R"rawliteral(
       <button onclick="apiCall('/api/reset')" class="btn btn-red" style="width:auto;padding:6px 18px">RESET</button>
     </div>
 
-    <!-- ── Main grid ─────────────────────────────────────────────────────── -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
 
-      <!-- Left column: controls + alert log -->
       <div class="panel p-5 space-y-4 flex flex-col lg:col-span-1">
 
         <div>
@@ -210,7 +198,6 @@ const char* html_page = R"rawliteral(
           <button onclick="apiCall('/api/servo')" id="btn-servo" class="btn btn-green">DISPENSE FOOD</button>
         </div>
 
-        <!-- Alert log -->
         <div style="flex:1">
           <div class="divider"></div>
           <div class="flex justify-between items-center mb-2">
@@ -223,16 +210,14 @@ const char* html_page = R"rawliteral(
         </div>
       </div>
 
-      <!-- Right: metrics + chart -->
       <div class="lg:col-span-3 space-y-4">
 
-        <!-- Sensor metric row — 5 cards -->
         <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
 
           <div class="panel p-4 flex flex-col items-center justify-center">
-            <span class="metric-lbl">Turbidity</span>
-            <span id="val-turb" class="metric-val glow-cyan mt-1">—</span>
-            <span class="metric-lbl">NTU</span>
+             <span class="metric-lbl">Network Latency</span>
+             <span id="val-latency" class="metric-val glow-cyan mt-1" style="font-size: 1.25rem;">—</span>
+             <span class="metric-lbl">ms</span>
           </div>
 
           <div class="panel p-4 flex flex-col items-center justify-center">
@@ -261,7 +246,6 @@ const char* html_page = R"rawliteral(
 
         </div>
 
-        <!-- Live chart -->
         <div class="panel p-5" style="flex:1">
           <div class="flex justify-between items-center mb-3 flex-wrap gap-2">
             <p class="mono text-xs font-bold tracking-widest" style="color:var(--c-muted)">LIVE POWER SIGNATURE</p>
@@ -285,7 +269,6 @@ const char* html_page = R"rawliteral(
           </div>
         </div>
 
-        <!-- Anomaly algorithm info -->
         <div class="panel p-4 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
           <div>
             <p class="mono font-bold tracking-widest mb-1" style="color:var(--c-muted)">ALGORITHM</p>
@@ -307,7 +290,7 @@ const char* html_page = R"rawliteral(
 
       </div>
     </div>
-  </div><!-- /max-w -->
+  </div>
 
   <script>
   // ── Chart setup ────────────────────────────────────────────────────────
@@ -391,24 +374,46 @@ const char* html_page = R"rawliteral(
   function sendNotification(title, body) {
     if (notifGranted) new Notification(title, { body, icon: '/favicon.ico' });
   }
-  // Auto-request on load (modern browsers require user gesture — the badge covers that)
 
-  // ── SSE  — Server-Sent Events for push data ────────────────────────────
-  // The server pushes a JSON event every ~400 ms.
-  // This eliminates polling and enables instant alert delivery.
+  // ── SSE Server-Sent Events & Calcolo Latenza (Jitter) ──────────────────
+  let lastEspTime = 0;
+  let lastBrowserTime = 0;
   let lastStatus = '';
+  
   const evtSource = new EventSource('/api/events');
 
   evtSource.onmessage = function(e) {
     let d;
     try { d = JSON.parse(e.data); } catch(_) { return; }
 
+    // ── Latenza di Rete ──
+    if (d.timestamp) {
+        const currentBrowserTime = Date.now();
+        if (lastEspTime !== 0 && lastBrowserTime !== 0) {
+            // Quanto tempo è passato secondo l'ESP32 (es. 400ms ideali)
+            const espDelta = d.timestamp - lastEspTime; 
+            // Quanto tempo è passato nella realtà del PC (es. 425ms reali)
+            const browserDelta = currentBrowserTime - lastBrowserTime; 
+            
+            // Il ritardo variabile inserito dalla rete (Jitter)
+            let networkLatency = browserDelta - espDelta;
+            
+            // Pulizia del dato per evitare valori negativi dovuti ai buffer del browser
+            if(networkLatency < 0) networkLatency = 0;
+            if(networkLatency > 2000) networkLatency = ">2000"; 
+            
+            document.getElementById('val-latency').textContent = networkLatency;
+        }
+        lastEspTime = d.timestamp;
+        lastBrowserTime = currentBrowserTime;
+    }
+
     // ── Metrics ──
     if (d.current   != null) document.getElementById('val-curr').textContent = d.current.toFixed(1);
     if (d.ewma      != null) document.getElementById('val-ewma').textContent = d.ewma.toFixed(1);
     if (d.voltage   != null) document.getElementById('val-volt').textContent = d.voltage.toFixed(2);
     if (d.temp      != null) document.getElementById('val-temp').textContent = d.temp.toFixed(1);
-    if (d.turbidity != null) document.getElementById('val-turb').textContent = Number(d.turbidity).toFixed(0);
+    
     if (d.th_stall  != null) document.getElementById('val-stall').textContent = d.th_stall > 0 ? d.th_stall.toFixed(1) : '—';
     if (d.th_dry    != null) document.getElementById('val-dry').textContent   = d.th_dry   > 0 ? d.th_dry.toFixed(1)   : '—';
 
@@ -433,7 +438,7 @@ const char* html_page = R"rawliteral(
     btnAuto.textContent = d.auto_mode ? '② STOP AUTO MODE' : '② TOGGLE AUTO MODE';
     btnAuto.className   = d.auto_mode ? 'btn btn-red' : 'btn btn-purple';
 
-    // ── Alert banner & push notification on status change ──
+    // ── Alert banner & push notification ──
     const alertBanner = document.getElementById('alert-banner');
     if (s === 'HALTED') {
       alertBanner.style.display = 'flex';
