@@ -34,19 +34,14 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <math.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int I2C_SDA     = 41;
 const int I2C_SCL     = 42;
 const int BUZZER_PIN  = 7;
-const int DS18B20_PIN = 4;   // OneWire data line (with 4.7 kΩ pull-up to 3.3 V)
 
 // ── Hardware ───────────────────────────────────────────────────────────────
 Adafruit_INA219   ina219;
-OneWire           oneWire(DS18B20_PIN);
-DallasTemperature tempSensor(&oneWire);
 
 // ── ESP-NOW peer (broadcast — replaced at runtime with real MAC if needed) ─
 uint8_t targetAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -60,11 +55,11 @@ String  anomaly_reason = "NONE";
 const int  MAX_SAMPLES = 60;
 float      samples[MAX_SAMPLES];
 int        sample_idx  = 0;
+int grace_period = 0;
 
 float baseline_mean    = 0.0f;
 float baseline_std     = 0.0f;
 float th_stall         = 0.0f;  // μ + 3σ
-float th_dry           = 0.0f;  // μ - 3σ  (floored at 0)
 float th_volt_min      = 0.0f;  // minimum healthy bus voltage
 bool  is_calibrated    = false;
 
@@ -142,9 +137,26 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     msg[len] = '\0';
     String s(msg);
 
+    // ── 1. Ricezione Log ───────────────────────────────────────────────────
     if (s.startsWith("LOG:")) {
         Serial.println(s.substring(4));
 
+    // ── 2. NUOVO: Ricezione Dati Sensori Remoti dal Target ─────────────────
+    } else if (s.startsWith("DATA:SENSOR:")) {
+        // Il Target invia: "DATA:SENSOR:valore_ntu,valore_temperatura"
+        // Esempio: "DATA:SENSOR:120.5,24.8"
+        String payload = s.substring(12); // Salta la stringa iniziale "DATA:SENSOR:"
+        int commaIndex = payload.indexOf(','); // Trova la posizione della virgola
+        
+        if (commaIndex != -1) {
+            // Estrapola il numero dopo la virgola e lo converte in float
+            last_temp_c = payload.substring(commaIndex + 1).toFloat();
+            
+            // Stampa di debug opzionale (puoi commentarla se intasa troppo la seriale)
+            // Serial.printf("[RAD] Temperatura aggiornata dal Target: %.1f °C\n", last_temp_c);
+        }
+
+    // ── 3. Gestione Comandi / Macchina a Stati ─────────────────────────────
     } else if (s == "CMD:START_LEARN") {
         current_mode  = "LEARNING";
         sample_idx    = 0;
@@ -159,45 +171,44 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         current_mode    = "MONITORING";
         anomaly_confirm = 0;
         ewma_init       = false;   // re-seed EWMA on each monitoring session
+        grace_period = 4;
         Serial.println("[OBS] MODE → MONITORING");
 
     } else if (s == "CMD:STOP_MEASURE") {
-        if (current_mode == "LEARNING" && sample_idx > 5) {
-            // ── Robust calibration with Z-score outlier rejection ──────────
-            float clean_mean, clean_std;
-            robustStats(samples, sample_idx, 1.5f, clean_mean, clean_std);
+            if (current_mode == "LEARNING" && sample_idx > 5) {
+                // ── Robust calibration with Z-score outlier rejection ──────────
+                float clean_mean, clean_std;
+                robustStats(samples, sample_idx, 1.5f, clean_mean, clean_std);
 
-            baseline_mean = clean_mean;
-            baseline_std  = clean_std;
+                baseline_mean = clean_mean;
+                baseline_std  = clean_std;
 
-            th_stall = baseline_mean + (3.0f * baseline_std);
-            th_dry   = baseline_mean - (3.0f * baseline_std);
+                // Calcola SOLO la soglia di stallo
+                th_stall = baseline_mean + (3.0f * baseline_std);
 
-            // Enforce minimum margins so sensor noise cannot collapse thresholds
-            if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
-            if (th_dry   < 0.0f)                   th_dry   = 0.0f;
+                // Enforce minimum margin so sensor noise cannot collapse threshold
+                if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
 
-            // Voltage threshold: 90 % of mean bus voltage seen during learning
-            th_volt_min = last_voltage * 0.90f;
+                // Voltage threshold: 90 % of mean bus voltage seen during learning
+                th_volt_min = last_voltage * 0.90f;
 
-            is_calibrated = true;
+                is_calibrated = true;
 
-            Serial.println("\n[OBS] ══ Calibration Complete (EWMA + Z-score) ══");
-            Serial.printf("   Samples   : %d\n",     sample_idx);
-            Serial.printf("   μ (mean)  : %.2f mA\n", baseline_mean);
-            Serial.printf("   σ (std)   : %.2f mA\n", baseline_std);
-            Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
-            Serial.printf("   Dry-run   : %.2f mA  (μ - 3σ)\n", th_dry);
-            Serial.printf("   Volt min  : %.2f V\n",  th_volt_min);
+                Serial.println("\n[OBS] ══ Calibration Complete (EWMA + Z-score) ══");
+                Serial.printf("   Samples   : %d\n",     sample_idx);
+                Serial.printf("   μ (mean)  : %.2f mA\n", baseline_mean);
+                Serial.printf("   σ (std)   : %.2f mA\n", baseline_std);
+                Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
+                Serial.printf("   Volt min  : %.2f V\n",  th_volt_min);
 
-            // Forward calibration result to dashboard
-            char buf[128];
-            snprintf(buf, sizeof(buf),
-                     "CAL:%.2f,%.2f,%.2f,%.2f",
-                     baseline_mean, baseline_std, th_stall, th_dry);
-            espNowSend(buf);
-        }
-        current_mode = "IDLE";
+                // Invia la calibrazione alla dashboard (solo 3 parametri ora)
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                        "CAL:%.2f,%.2f,%.2f",
+                        baseline_mean, baseline_std, th_stall);
+                espNowSend(buf);
+            }
+            current_mode = "IDLE";
 
     } else if (s == "CMD:RESET") {
         system_locked   = false;
@@ -212,6 +223,10 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
 // ── setup ──────────────────────────────────────────────────────────────────
 void setup() {
+    // AGGIUNGI QUESTE TRE RIGHE:
+    delay(3000); 
+    Serial.println("\n\n[SISTEMA] Seriale Connessa! Avvio boot...");
+
     Serial.begin(115200);
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
@@ -225,12 +240,6 @@ void setup() {
         Serial.println("[OBS] CRITICAL: INA219 not found!");
         while (1) delay(100);
     }
-
-    // DS18B20
-    tempSensor.begin();
-    tempSensor.setResolution(11);   // 11-bit ≈ 375 ms conversion, 0.125 °C res.
-    tempSensor.setWaitForConversion(false);
-    tempSensor.requestTemperatures();
 
     // ESP-NOW
     WiFi.mode(WIFI_STA);
@@ -271,13 +280,6 @@ void loop() {
     last_current = max(0.0f, raw_current);
     last_voltage = max(0.0f, bus_voltage);
 
-    // Non-blocking DS18B20 read (result ready ~375 ms after last request)
-    float t = tempSensor.getTempCByIndex(0);
-    if (t != DEVICE_DISCONNECTED_C && t > -10.0f && t < 60.0f) {
-        last_temp_c = t;
-    }
-    tempSensor.requestTemperatures();   // start next conversion
-
     // ── 2. Update EWMA ─────────────────────────────────────────────────────
     if (!ewma_init) {
         ewma_current = last_current;
@@ -314,24 +316,28 @@ void loop() {
 
     // ── 5. Monitoring phase ────────────────────────────────────────────────
     if (current_mode == "MONITORING" && is_calibrated) {
+        if (grace_period > 0) {
+            grace_period--;
+            Serial.printf("   [MON] SPUNTO MOTORE (ignoro allarmi)... I_raw=%.1f mA\n", last_current);
+            delay(400);
+            return; // <--- QUESTO RETURN È FONDAMENTALE! FERMA I CALCOLI QUI.
+        }
         // Z-score of the EWMA-smoothed current against learned baseline
         float z_score = (baseline_std > 1e-6f)
                         ? (ewma_current - baseline_mean) / baseline_std
                         : 0.0f;
 
         bool stall_flag    = (ewma_current > th_stall);      // over-current
-        bool dry_run_flag  = (last_current  > 10.0f &&       // spinning but no load
-                              ewma_current  < th_dry);
+
         bool volt_flag     = (th_volt_min > 0.1f &&
                               last_voltage < th_volt_min);   // supply drop
 
-        bool anomaly = stall_flag || dry_run_flag || volt_flag;
+        bool anomaly = stall_flag || volt_flag;
 
         Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s%s\n",
                       last_current, ewma_current, z_score, last_voltage, last_temp_c,
                       anomaly_confirm, CONFIRM_NEEDED,
                       stall_flag   ? " STALL"   : "",
-                      dry_run_flag ? " DRY-RUN" : "",
                       volt_flag    ? " VOLT-LOW" : "");
 
         if (anomaly) {
@@ -339,7 +345,6 @@ void loop() {
             if (anomaly_confirm >= CONFIRM_NEEDED) {
                 // ── FAULT CONFIRMED ────────────────────────────────────────
                 if      (stall_flag)   anomaly_reason = "MOTOR_STALL";
-                else if (dry_run_flag) anomaly_reason = "DRY_RUN";
                 else                   anomaly_reason = "VOLTAGE_DROP";
 
                 Serial.printf("\n[!!!] ANOMALY CONFIRMED: %s\n", anomaly_reason.c_str());

@@ -2,54 +2,13 @@
  * FLOAT - Target Node
  * ====================
  * Responsibilities:
- *  - Read real turbidity via analog sensor (e.g. DFRobot SEN0189 / generic TSD-10)
- *    connected to GPIO 1 (ADC1_CH0).  Output is 0–4095 → converted to NTU.
- *  - Read water temperature via DS18B20 on GPIO 4 (shared OneWire bus)
- *  - Control the water pump (GPIO 47)
- *  - Control the servo feeder (GPIO 6, bit-bang PWM)
- *  - Send structured LOG and CMD messages to Observer via ESP-NOW
- *  - Receive HALT from Observer and enter deep sleep
- *
- * Turbidity sensor calibration
- * ------------------------------
- * The SEN0189 / generic voltage-output turbidity sensor produces:
- *   ~4.2 V (≈ 3435 ADC counts on 3.3 V ESP32 ADC) in clean water
- *   ~2.5 V (≈ 2048 counts) at ~3000 NTU
- *
- * We use a two-point linear mapping:
- *   NTU = (CLEAN_ADC - adc_reading) * NTU_PER_COUNT
- *
- * A NTU > TURB_THRESHOLD triggers the pump cycle.
- * Adjust TURB_CLEAN_ADC and TURB_DIRTY_ADC for your specific sensor.
- *
- * Battery life estimate  (answers professor Q3)
- * -----------------------------------------------
- *  Component         Active current    Sleep current
- *  ESP32-S3          ~80 mA            ~10 µA
- *  INA219 (observer) ~1 mA             (N/A — on observer board)
- *  DS18B20           ~1.5 mA           ~1 µA
- *  Pump              ~350 mA (only when running, gated by MOSFET)
- *
- * Duty cycle: 10 s active, 10 s deep sleep → 50 % sleep fraction.
- *
- * Average node current (excluding pump):
- *   I_avg = 0.5 × 80 mA + 0.5 × 0.010 mA ≈ 40 mA
- *
- * With a 3 000 mAh LiPo:
- *   T = 3000 / 40 ≈ 75 h  ≈  ~3 days  (node alone, no pump)
- *
- * The pump runs ~10 s every wake cycle only when turbidity > threshold.
- * Assuming it runs 20 % of cycles: pump contribution ≈ 0.5 × 0.2 × 350 = 35 mA
- *   Total I_avg with pump ≈ 75 mA  →  T ≈ 40 h  ≈  ~1.7 days
- *
- * "20 days" is NOT achievable with this hardware on a 3 000 mAh cell.
- * To reach 20 days (480 h) the average current must be ≤ 6.25 mA,
- * requiring either:
- *   a) a much larger battery (~2 000 mAh @ 6 mA → feasible with 30 000 mAh pack)
- *   b) a much lower active duty cycle (e.g. 30 s sleep, 2 s active → I_avg ≈ 5 mA)
- *   c) a low-power MCU (e.g. ESP32-C3 in modem-sleep or LoRa node)
- *
- * The claim of 20 days should be revised or backed with a specific battery spec.
+ * - Read real turbidity via analog sensor (e.g. DFRobot SEN0189 / generic TSD-10)
+ * connected to GPIO 1 (ADC1_CH0).  Output is 0–4095 → converted to NTU.
+ * - Read water temperature via DS18B20 on GPIO 4 (shared OneWire bus)
+ * - Control the water pump (GPIO 47)
+ * - Control the servo feeder (GPIO 6, bit-bang PWM)
+ * - Send structured LOG and CMD messages to Observer via ESP-NOW
+ * - Receive HALT from Observer and enter deep sleep
  */
 
 #include <Arduino.h>
@@ -67,12 +26,12 @@ const int TURBIDITY_PIN  = 1;   // ADC1_CH0 — analog turbidity sensor output
 const int DS18B20_PIN    = 4;   // OneWire (4.7 kΩ pull-up to 3.3 V)
 
 // ── Turbidity sensor calibration ──────────────────────────────────────────
-// Tune these two constants against your actual sensor in clear water and
-// in water of known NTU (a standard NTU solution, or compare vs a meter).
-const int   TURB_CLEAN_ADC    = 3435;   // ADC count in distilled water (≈ 0 NTU)
-const int   TURB_DIRTY_ADC    = 1200;   // ADC count at ~3000 NTU reference
-const float TURB_MAX_NTU      = 3000.0f;
-const float TURB_THRESHOLD_NTU = 100.0f; // NTU above which pump activates
+// DOPO AVER LETTO IL VALORE GREZZO SUL MONITOR, AGGIORNA QUESTI DUE NUMERI:
+const int   TURB_CLEAN_ADC     = 3435;   // ADC in acqua pulita (valore alto)
+const int   TURB_DIRTY_ADC     = 1200;   // ADC in acqua molto sporca (valore basso)
+
+const float TURB_MAX_NTU       = 3000.0f;
+const float TURB_THRESHOLD_NTU = 100.0f; // NTU oltre il quale si attiva la pompa
 
 // ── RTC-persistent state (survives deep sleep) ─────────────────────────────
 RTC_DATA_ATTR int  bootCount      = 0;
@@ -101,14 +60,15 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 void sendMsg(const String& type, const String& content) {
     String full = type + ":" + content;
     esp_now_send(observerAddress, (const uint8_t*)full.c_str(), full.length());
-    delay(80);
+    delay(150);
 }
 
 /**
  * Read turbidity via ADC and return NTU.
- * Takes 16 averaged samples to reduce ADC noise on ESP32.
+ * [VERSIONE REALE: Legge il modulo rosso collegato al Pin 1]
  */
 float readTurbidityNTU() {
+    // Fa 16 letture veloci e calcola la media per filtrare i "rumori" elettrici dell'acqua
     long sum = 0;
     for (int i = 0; i < 16; i++) {
         sum += analogRead(TURBIDITY_PIN);
@@ -116,13 +76,17 @@ float readTurbidityNTU() {
     }
     int adc = (int)(sum / 16);
 
-    // Clamp to calibration range
+    // ── STAMPA IL VALORE GREZZO PER LA CALIBRAZIONE MANUALE ──
+    Serial.printf("[SENSOR] Valore ADC Grezzo (da copiare in alto): %d\n", adc);
+
+    // Evita che il valore esca dai limiti imposti in alto
     adc = constrain(adc, TURB_DIRTY_ADC, TURB_CLEAN_ADC);
 
-    // Linear interpolation: lower ADC → higher turbidity
+    // Interpolazione lineare: ADC più basso = Acqua più sporca (più NTU)
     float ntu = TURB_MAX_NTU *
                 (float)(TURB_CLEAN_ADC - adc) /
                 (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
+                
     return constrain(ntu, 0.0f, TURB_MAX_NTU);
 }
 
@@ -158,12 +122,15 @@ void setup() {
     // ── Sensors ────────────────────────────────────────────────────────────
     tempSensor.begin();
     tempSensor.setResolution(11);
+    tempSensor.setWaitForConversion(false);
     tempSensor.requestTemperatures();
     delay(400);   // allow DS18B20 conversion
+    
     float water_temp = tempSensor.getTempCByIndex(0);
     if (water_temp == DEVICE_DISCONNECTED_C || water_temp < -10.0f)
         water_temp = 25.0f;   // fallback if probe absent
 
+    // ── LEGGE IL SENSORE VERO ──
     float turbidity_ntu = readTurbidityNTU();
     int   turbidity_pct = (int)((turbidity_ntu / TURB_MAX_NTU) * 100.0f);
 
@@ -196,7 +163,7 @@ void setup() {
                         String(water_temp, 1);
     sendMsg("DATA", sensorPack);
 
-    // ── Decision logic ─────────────────────────────────────────────────────
+// ── Decision logic ─────────────────────────────────────────────────────
     if (bootCount == 0) {
         // ── First boot: calibration learning phase ─────────────────────────
         sendMsg("LOG", "[ACTION] First boot → calibration learning phase");
@@ -205,7 +172,20 @@ void setup() {
 
         digitalWrite(PUMP_PIN, HIGH);
         unsigned long t0 = millis();
-        while (millis() - t0 < 10000 && !emergency_stop) delay(10);
+        unsigned long last_update = millis();
+
+        while (millis() - t0 < 10000 && !emergency_stop) {
+            if (millis() - last_update >= 500) {
+                last_update = millis();
+                float live_turb = readTurbidityNTU();
+                float live_temp = tempSensor.getTempCByIndex(0);
+                tempSensor.requestTemperatures(); 
+                
+                String livePack = "SENSOR:" + String(live_turb, 1) + "," + String(live_temp, 1);
+                sendMsg("DATA", livePack);
+            }
+            delay(10);
+        }
         digitalWrite(PUMP_PIN, LOW);
 
         sendMsg("CMD", "STOP_MEASURE");
@@ -219,7 +199,20 @@ void setup() {
 
         digitalWrite(PUMP_PIN, HIGH);
         unsigned long t0 = millis();
-        while (millis() - t0 < 10000 && !emergency_stop) delay(10);
+        unsigned long last_update = millis();
+
+        while (millis() - t0 < 10000 && !emergency_stop) {
+            if (millis() - last_update >= 500) {
+                last_update = millis();
+                float live_turb = readTurbidityNTU();
+                float live_temp = tempSensor.getTempCByIndex(0);
+                tempSensor.requestTemperatures(); 
+                
+                String livePack = "SENSOR:" + String(live_turb, 1) + "," + String(live_temp, 1);
+                sendMsg("DATA", livePack);
+            }
+            delay(10); 
+        }
         digitalWrite(PUMP_PIN, LOW);
 
         sendMsg("CMD", "STOP_MEASURE");
