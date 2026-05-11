@@ -2,20 +2,20 @@
  * FLOAT - Observer Node
  * =====================
  * Responsibilities:
- *  - Measure pump current AND bus voltage via INA219
- *  - Measure water temperature via DS18B20 (OneWire, GPIO 4)
- *  - Run EWMA + sliding-window Z-score anomaly detection
- *    (detects BOTH stall / over-current  AND  dry-run / under-current)
- *  - Send HALT command to Target via ESP-NOW on confirmed anomaly
- *  - Drive buzzer alert
- *  - Forward telemetry to the Dashboard node via ESP-NOW "TELEM:" frames
- *    so the web dashboard (served by main.cpp) always has fresh sensor data
+ * - Measure pump current AND bus voltage via INA219
+ * - Measure water temperature via DS18B20 (OneWire, GPIO 4)
+ * - Run EWMA + sliding-window Z-score anomaly detection
+ * (detects BOTH stall / over-current  AND  dry-run / under-current)
+ * - Send HALT command to Target via ESP-NOW on confirmed anomaly
+ * - Drive buzzer alert
+ * - Forward telemetry to the Dashboard node via ESP-NOW "TELEM:" frames
+ * so the web dashboard (served by main.cpp) always has fresh sensor data
  *
  * Anomaly Detection Algorithm  –  EWMA + Z-score
  * ------------------------------------------------
  * Classic 3-sigma on raw samples is brittle:
- *   • it treats every spike as independent
- *   • a single stuck sample can reset the counter and delay detection
+ * • it treats every spike as independent
+ * • a single stuck sample can reset the counter and delay detection
  *
  * EWMA smooths the signal first (α = 0.2), then a Z-score of the
  * smoothed value against the learned baseline flags anomalies.
@@ -23,9 +23,9 @@
  * a fault — this combines trend sensitivity with noise immunity.
  *
  * Detected anomaly types:
- *   MOTOR_STALL  – EWMA current >> μ  (rotor blocked, high torque)
- *   DRY_RUN      – EWMA current << μ  (no water load, pump spinning free)
- *   VOLTAGE_DROP – Bus voltage drops below calibrated minimum
+ * MOTOR_STALL  – EWMA current >> μ  (rotor blocked, high torque)
+ * DRY_RUN      – EWMA current << μ  (no water load, pump spinning free)
+ * VOLTAGE_DROP – Bus voltage drops below calibrated minimum
  */
 
 #include <Arduino.h>
@@ -45,6 +45,14 @@ Adafruit_INA219   ina219;
 
 // ── ESP-NOW peer (broadcast — replaced at runtime with real MAC if needed) ─
 uint8_t targetAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ── Variabili di Sicurezza (AES & Anti-Replay) ─────────────────────────────
+// Le chiavi AES devono essere ESATTAMENTE di 16 caratteri e identiche al Target
+const char *PMK_KEY_STR = "SuperSegretoPMK!"; 
+const char *LMK_KEY_STR = "ChiaveTarget1234";
+
+unsigned long last_received_seq = 0; // Traccia i messaggi in entrata dal Target
+unsigned long obs_seq_num = 1;       // Contatore per i messaggi in uscita dall'Observer
 
 // ── System state ───────────────────────────────────────────────────────────
 String  current_mode   = "IDLE";    // IDLE | LEARNING | MONITORING
@@ -117,9 +125,14 @@ void robustStats(float* arr, int n, float z_limit,
     clean_std = sqrtf(sq / cnt);
 }
 
-/** Send a short string message over ESP-NOW */
+/** Send a short string message over ESP-NOW (CON SICUREZZA ANTI-REPLAY) */
 void espNowSend(const char* msg) {
-    esp_now_send(targetAddress, (const uint8_t*)msg, strlen(msg));
+    // Aggiunge il sequence number in coda (es: "HALT|SEQ:4")
+    String secureMsg = String(msg) + "|SEQ:" + String(obs_seq_num);
+    
+    esp_now_send(targetAddress, (const uint8_t*)secureMsg.c_str(), secureMsg.length());
+    
+    obs_seq_num++; // Incrementa per il prossimo messaggio
 }
 
 /** Buzz N times */
@@ -130,30 +143,42 @@ void buzzerAlert(int times) {
     }
 }
 
-// ── ESP-NOW receive callback ────────────────────────────────────────────────
+// ── ESP-NOW receive callback (CON DECODIFICA SICURA) ────────────────────────
 void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     char msg[len + 1];
     memcpy(msg, data, len);
     msg[len] = '\0';
     String s(msg);
 
+    // ── 0. Controllo di Sicurezza Anti-Replay ──────────────────────────────
+    int seqIndex = s.indexOf("|SEQ:");
+    if (seqIndex > 0) {
+        String cleanMsg = s.substring(0, seqIndex); // Estrae il vero messaggio
+        unsigned long incomingSeq = s.substring(seqIndex + 5).toInt(); 
+
+        if (incomingSeq <= last_received_seq) {
+            Serial.printf("[SECURITY] Replay Attack Bloccato! Seq: %lu, Atteso: > %lu\n", incomingSeq, last_received_seq);
+            return; // SCARTA IL PACCHETTO!
+        }
+        
+        last_received_seq = incomingSeq;
+        s = cleanMsg; // Sostituisce la stringa 's' con la versione pulita senza |SEQ:x
+    } else {
+        Serial.println("[SECURITY] Pacchetto scartato: Manca Sequence Number.");
+        return; // Blocca tutto ciò che non rispetta il formato di sicurezza
+    }
+
     // ── 1. Ricezione Log ───────────────────────────────────────────────────
     if (s.startsWith("LOG:")) {
         Serial.println(s.substring(4));
 
-    // ── 2. NUOVO: Ricezione Dati Sensori Remoti dal Target ─────────────────
+    // ── 2. Ricezione Dati Sensori Remoti dal Target ─────────────────────────
     } else if (s.startsWith("DATA:SENSOR:")) {
-        // Il Target invia: "DATA:SENSOR:valore_ntu,valore_temperatura"
-        // Esempio: "DATA:SENSOR:120.5,24.8"
-        String payload = s.substring(12); // Salta la stringa iniziale "DATA:SENSOR:"
-        int commaIndex = payload.indexOf(','); // Trova la posizione della virgola
+        String payload = s.substring(12); 
+        int commaIndex = payload.indexOf(','); 
         
         if (commaIndex != -1) {
-            // Estrapola il numero dopo la virgola e lo converte in float
             last_temp_c = payload.substring(commaIndex + 1).toFloat();
-            
-            // Stampa di debug opzionale (puoi commentarla se intasa troppo la seriale)
-            // Serial.printf("[RAD] Temperatura aggiornata dal Target: %.1f °C\n", last_temp_c);
         }
 
     // ── 3. Gestione Comandi / Macchina a Stati ─────────────────────────────
@@ -183,13 +208,10 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
                 baseline_mean = clean_mean;
                 baseline_std  = clean_std;
 
-                // Calcola SOLO la soglia di stallo
                 th_stall = baseline_mean + (3.0f * baseline_std);
 
-                // Enforce minimum margin so sensor noise cannot collapse threshold
                 if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
 
-                // Voltage threshold: 90 % of mean bus voltage seen during learning
                 th_volt_min = last_voltage * 0.90f;
 
                 is_calibrated = true;
@@ -201,7 +223,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
                 Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
                 Serial.printf("   Volt min  : %.2f V\n",  th_volt_min);
 
-                // Invia la calibrazione alla dashboard (solo 3 parametri ora)
                 char buf[128];
                 snprintf(buf, sizeof(buf),
                         "CAL:%.2f,%.2f,%.2f",
@@ -223,7 +244,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
 // ── setup ──────────────────────────────────────────────────────────────────
 void setup() {
-    // AGGIUNGI QUESTE TRE RIGHE:
     delay(3000); 
     Serial.println("\n\n[SISTEMA] Seriale Connessa! Avvio boot...");
 
@@ -241,24 +261,32 @@ void setup() {
         while (1) delay(100);
     }
 
-    // ESP-NOW
+    // ── ESP-NOW SECURE INIT ────────────────────────────────────────────────
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK) {
         Serial.println("[OBS] ESP-NOW init failed");
         return;
     }
+
+    // 1. Imposta la Primary Master Key (PMK) - DEVE combaciare col Target
+    esp_now_set_pmk((uint8_t *)PMK_KEY_STR);
+
     esp_now_register_recv_cb(OnDataRecv);
 
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(peer));
     memcpy(peer.peer_addr, targetAddress, 6);
     peer.channel = 0;
-    peer.encrypt = false;
+    
+    // 2. ATTIVAZIONE DELLA CRITTOGRAFIA AES E INSERIMENTO DELLA CHIAVE LMK
+    peer.encrypt = true;
+    memcpy(peer.lmk, LMK_KEY_STR, 16);
+    
     esp_now_add_peer(&peer);
 
     Serial.println("\n╔══════════════════════════════════════════╗");
-    Serial.println("║  FLOAT  –  Observer Node (v2)           ║");
-    Serial.println("║  Anomaly: EWMA + Z-score (stall+dry-run)║");
+    Serial.println("║  FLOAT  –  Observer Node (SECURE)        ║");
+    Serial.println("║  Anomaly: EWMA + Z-score (stall+dry-run) ║");
     Serial.println("╚══════════════════════════════════════════╝");
 }
 
@@ -292,7 +320,6 @@ void loop() {
     if (system_locked) {
         Serial.printf("[HALT] Locked. I=%.1f mA  V=%.2f V  T=%.1f°C\n",
                       last_current, last_voltage, last_temp_c);
-        // Still forward telemetry so dashboard shows live sensor data
         char buf[128];
         snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,HALTED,%s",
                  last_current, last_voltage, last_temp_c, anomaly_reason.c_str());
@@ -304,7 +331,6 @@ void loop() {
 
     // ── 4. Learning phase ──────────────────────────────────────────────────
     if (current_mode == "LEARNING") {
-        // Only record samples after motor has fully spun up (> 50 mA)
         if (last_current > 50.0f && sample_idx < MAX_SAMPLES) {
             samples[sample_idx++] = last_current;
             Serial.printf("   [LEARN] #%d  I=%.2f mA  V=%.2f V\n",
@@ -320,9 +346,8 @@ void loop() {
             grace_period--;
             Serial.printf("   [MON] SPUNTO MOTORE (ignoro allarmi)... I_raw=%.1f mA\n", last_current);
             delay(400);
-            return; // <--- QUESTO RETURN È FONDAMENTALE! FERMA I CALCOLI QUI.
+            return; 
         }
-        // Z-score of the EWMA-smoothed current against learned baseline
         float z_score = (baseline_std > 1e-6f)
                         ? (ewma_current - baseline_mean) / baseline_std
                         : 0.0f;
@@ -334,7 +359,7 @@ void loop() {
 
         bool anomaly = stall_flag || volt_flag;
 
-        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s%s\n",
+        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s\n",
                       last_current, ewma_current, z_score, last_voltage, last_temp_c,
                       anomaly_confirm, CONFIRM_NEEDED,
                       stall_flag   ? " STALL"   : "",
@@ -351,10 +376,9 @@ void loop() {
                 Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V\n",
                               ewma_current, z_score, last_voltage);
 
-                // Send HALT to Target node
+                // Send HALT to Target node (ora crittografato e numerato!)
                 espNowSend("HALT");
 
-                // Forward event to dashboard
                 char alert[64];
                 snprintf(alert, sizeof(alert), "ALERT:%s", anomaly_reason.c_str());
                 espNowSend(alert);
@@ -366,7 +390,6 @@ void loop() {
             anomaly_confirm = 0;
         }
 
-        // Forward live telemetry to dashboard (every monitoring tick)
         char buf[128];
         snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,MONITORING,OK",
                  last_current, last_voltage, last_temp_c);
@@ -380,7 +403,6 @@ void loop() {
     Serial.printf("[IDLE] I=%.2f mA  V=%.2f V  T=%.1f°C\n",
                   last_current, last_voltage, last_temp_c);
 
-    // Forward idle telemetry
     char buf[128];
     snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,IDLE,OK",
              last_current, last_voltage, last_temp_c);
