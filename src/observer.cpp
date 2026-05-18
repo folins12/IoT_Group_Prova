@@ -44,7 +44,7 @@ const int BUZZER_PIN  = 7;
 Adafruit_INA219   ina219;
 
 // ── ESP-NOW peer (broadcast — replaced at runtime with real MAC if needed) ─
-uint8_t targetAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
 
 // ── Variabili di Sicurezza (AES & Anti-Replay) ─────────────────────────────
 // Le chiavi AES devono essere ESATTAMENTE di 16 caratteri e identiche al Target

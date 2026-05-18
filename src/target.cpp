@@ -39,7 +39,7 @@ RTC_DATA_ATTR unsigned long last_received_seq = 0;
 RTC_DATA_ATTR unsigned long target_seq_num = 1;    
 
 // ── Globals ────────────────────────────────────────────────────────────────
-uint8_t observerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Continuiamo col Broadcast per ora
+uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60}; // Continuiamo col Broadcast per ora
 volatile bool emergency_stop = false;
 
 // Le chiavi AES devono essere ESATTAMENTE di 16 caratteri
