@@ -37,7 +37,12 @@ float baseline_mean    = 0.0f;
 float baseline_std     = 0.0f;
 float th_stall         = 0.0f;  // μ + 3σ
 float th_volt_min      = 0.0f;  // minimum healthy bus voltage
+float th_dry_run       = 0.0f;  // §7A: 30% di baseline_mean
 bool  is_calibrated    = false;
+
+// ── Soglie temperatura (§4) ────────────────────────────────────────────────
+const float TEMP_MIN_C = 18.0f;
+const float TEMP_MAX_C = 32.0f;
 
 // ── EWMA state ─────────────────────────────────────────────────────────────
 const float EWMA_ALPHA = 0.2f;  // smoothing factor  (0 = no update, 1 = raw)
@@ -65,27 +70,43 @@ void computeStats(float* arr, int n, float& mean, float& std_dev) {
     std_dev = sqrtf(sq / n);
 }
 
-void robustStats(float* arr, int n, float z_limit,
+// ── Hampel helpers (§1 – sostituisce robustStats) ─────────────────────────
+// Usa MAD (Median Absolute Deviation) invece della 3σ classica:
+// robusta agli outlier per costruzione, non distorce la baseline.
+
+float arrayMedian(float* arr, int n) {
+    float buf[n];
+    memcpy(buf, arr, n * sizeof(float));
+    for (int i = 1; i < n; i++) {
+        float key = buf[i]; int j = i - 1;
+        while (j >= 0 && buf[j] > key) { buf[j+1] = buf[j]; j--; }
+        buf[j+1] = key;
+    }
+    return (n % 2 == 0) ? (buf[n/2-1] + buf[n/2]) / 2.0f : buf[n/2];
+}
+
+void hampelStats(float* arr, int n, float k_sigma,
                  float& clean_mean, float& clean_std) {
-    float raw_mean, raw_std;
-    computeStats(arr, n, raw_mean, raw_std);
+    if (n < 3) { computeStats(arr, n, clean_mean, clean_std); return; }
 
-    float sum = 0.0f;
-    float sq  = 0.0f;
-    int   cnt = 0;
+    float med = arrayMedian(arr, n);
 
+    float devs[n];
+    for (int i = 0; i < n; i++) devs[i] = fabsf(arr[i] - med);
+
+    float mad     = arrayMedian(devs, n);
+    float sigma_h = 1.4826f * mad;   // stimatore consistente di σ
+
+    float sum = 0.0f; float sq = 0.0f; int cnt = 0;
     for (int i = 0; i < n; i++) {
-        if (raw_std < 1e-6f || fabsf(arr[i] - raw_mean) / raw_std <= z_limit) {
-            sum += arr[i];
-            cnt++;
+        if (sigma_h < 1e-6f || fabsf(arr[i] - med) <= k_sigma * sigma_h) {
+            sum += arr[i]; cnt++;
         }
     }
-
-    if (cnt < 3) { clean_mean = raw_mean; clean_std = raw_std; return; }
+    if (cnt < 3) { clean_mean = med; clean_std = sigma_h; return; }
     clean_mean = sum / cnt;
-
     for (int i = 0; i < n; i++) {
-        if (raw_std < 1e-6f || fabsf(arr[i] - raw_mean) / raw_std <= z_limit)
+        if (sigma_h < 1e-6f || fabsf(arr[i] - med) <= k_sigma * sigma_h)
             sq += powf(arr[i] - clean_mean, 2);
     }
     clean_std = sqrtf(sq / cnt);
@@ -108,6 +129,16 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     memcpy(msg, data, len);
     msg[len] = '\0';
     String s(msg);
+
+    // §2 – ACK handshake: se il messaggio contiene |ID:N|, risponde ACK:N al mittente
+    int id_pos = s.indexOf("|ID:");
+    if (id_pos != -1) {
+        uint32_t msg_id = (uint32_t)s.substring(id_pos + 4).toInt();
+        s = s.substring(0, id_pos);   // tronca il suffisso prima del parsing
+        char ack_buf[32];
+        snprintf(ack_buf, sizeof(ack_buf), "ACK:%lu", (unsigned long)msg_id);
+        esp_now_send(mac, (const uint8_t*)ack_buf, strlen(ack_buf));
+    }
 
     if (s.startsWith("LOG:")) {
         Serial.println(s.substring(4));
@@ -137,24 +168,27 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     } else if (s == "CMD:STOP_MEASURE") {
             if (current_mode == "LEARNING" && sample_idx > 5) {
                 float clean_mean, clean_std;
-                robustStats(samples, sample_idx, 1.5f, clean_mean, clean_std);
+                hampelStats(samples, sample_idx, 3.0f, clean_mean, clean_std); // §1
 
                 baseline_mean = clean_mean;
                 baseline_std  = clean_std;
-                th_stall = baseline_mean + (3.0f * baseline_std);
+                th_stall    = baseline_mean + (3.0f * baseline_std);
                 if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
                 th_volt_min = last_voltage * 0.90f;
+                th_dry_run  = baseline_mean * 0.30f;  // §7A: 30% del consumo normale
                 is_calibrated = true;
 
-                Serial.println("\n[OBS] ══ Calibration Complete (EWMA + Z-score) ══");
-                Serial.printf("   Samples   : %d\n",     sample_idx);
-                Serial.printf("   μ (mean)  : %.2f mA\n", baseline_mean);
-                Serial.printf("   σ (std)   : %.2f mA\n", baseline_std);
+                Serial.println("\n[OBS] ══ Calibration Complete (EWMA + Hampel) ══");
+                Serial.printf("   Samples   : %d\n",              sample_idx);
+                Serial.printf("   μ (mean)  : %.2f mA\n",         baseline_mean);
+                Serial.printf("   σ (std)   : %.2f mA\n",         baseline_std);
                 Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
-                Serial.printf("   Volt min  : %.2f V\n",  th_volt_min);
+                Serial.printf("   Dry-run   : %.2f mA  (30%% μ)\n",  th_dry_run);
+                Serial.printf("   Volt min  : %.2f V\n",           th_volt_min);
 
-                char buf[128];
-                snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f", baseline_mean, baseline_std, th_stall);
+                char buf[160];
+                snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f,%.2f",
+                         baseline_mean, baseline_std, th_stall, th_dry_run);
                 espNowSend(buf);
             }
             current_mode = "IDLE";
@@ -212,10 +246,10 @@ void setup() {
     peer.encrypt = false;
     esp_now_add_peer(&peer);
 
-    Serial.println("\n╔══════════════════════════════════════════╗");
-    Serial.println("║  FLOAT  –  Observer Node (v2)           ║");
-    Serial.println("║  Anomaly: EWMA + Z-score (stall+dry-run)║");
-    Serial.println("╚══════════════════════════════════════════╝");
+    Serial.println("\n╔══════════════════════════════════════════════╗");
+    Serial.println("║  FLOAT  –  Observer Node (v3)               ║");
+    Serial.println("║  Anomaly: EWMA + Hampel + DRY_RUN + TEMP    ║");
+    Serial.println("╚══════════════════════════════════════════════╝");
 }
 
 // ── loop ───────────────────────────────────────────────────────────────────
@@ -267,23 +301,33 @@ void loop() {
             delay(400);
             return; 
         }
-        float z_score = (baseline_std > 1e-6f) ? (ewma_current - baseline_mean) / baseline_std : 0.0f;
-        bool stall_flag    = (ewma_current > th_stall);
-        bool volt_flag     = (th_volt_min > 0.1f && last_voltage < th_volt_min);
-        bool anomaly = stall_flag || volt_flag;
+        float z_score   = (baseline_std > 1e-6f) ? (ewma_current - baseline_mean) / baseline_std : 0.0f;
+        bool stall_flag = (ewma_current > th_stall);
+        bool volt_flag  = (th_volt_min > 0.1f && last_voltage < th_volt_min);
+        bool dry_flag   = (th_dry_run  > 0.1f && ewma_current < th_dry_run);   // §7A
+        bool temp_flag  = (last_temp_c < TEMP_MIN_C || last_temp_c > TEMP_MAX_C); // §4
+        bool anomaly    = stall_flag || volt_flag || dry_flag || temp_flag;
 
-        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s%s\n",
+        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s%s%s\n",
                       last_current, ewma_current, z_score, last_voltage, last_temp_c,
-                      anomaly_confirm, CONFIRM_NEEDED, stall_flag ? " STALL" : "", volt_flag ? " VOLT-LOW" : "");
+                      anomaly_confirm, CONFIRM_NEEDED,
+                      stall_flag ? " STALL"    : "",
+                      volt_flag  ? " VOLT-LOW" : "",
+                      dry_flag   ? " DRY-RUN"  : "",
+                      temp_flag  ? " TEMP-ERR" : "");
 
         if (anomaly) {
             anomaly_confirm++;
             if (anomaly_confirm >= CONFIRM_NEEDED) {
-                if      (stall_flag)   anomaly_reason = "MOTOR_STALL";
-                else                   anomaly_reason = "VOLTAGE_DROP";
+                // Priorità: stall > dry-run > tensione > temperatura
+                if      (stall_flag) anomaly_reason = "MOTOR_STALL";
+                else if (dry_flag)   anomaly_reason = "DRY_RUN";
+                else if (volt_flag)  anomaly_reason = "VOLTAGE_DROP";
+                else                 anomaly_reason = "TEMP_OUT_OF_RANGE";
 
                 Serial.printf("\n[!!!] ANOMALY CONFIRMED: %s\n", anomaly_reason.c_str());
-                Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V\n", ewma_current, z_score, last_voltage);
+                Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V  T=%.1f°C\n",
+                              ewma_current, z_score, last_voltage, last_temp_c);
 
                 // --- MODIFICA 3: RAFFICA DI EMERGENZA (Anti-Interferenze) ---
                 for (int i = 0; i < 10; i++) {
