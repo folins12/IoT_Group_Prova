@@ -46,21 +46,6 @@ RTC_DATA_ATTR uint32_t last_cmd_id          = 0;   // per de-duplicazione ACK
 RTC_DATA_ATTR int      consecutive_noack    = 0;   // comunicazioni fallite consecutive
 RTC_DATA_ATTR int      anomaly_count        = 0;   // anomalie totali per rilevare PERIODIC_STALL
 
-
-// ── Variabili salvate in Deep Sleep ────────────────────────────────────────
-RTC_DATA_ATTR int  bootCount     = 0;
-RTC_DATA_ATTR bool system_halted = false;
-RTC_DATA_ATTR float ultima_temp_valida = 25.0f; // AGGIUNTO: Memoria della temperatura
-
-uint8_t observerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-volatile bool emergency_stop = false;
-
-// AGGIUNTO: Funzione per la Torbidità Simulata
-float readTurbidityNTU() {
-    if (bootCount % 2 != 0) return 500.0f; // Cicli dispari: simula Acqua Sporca
-    else return 20.0f;                     // Cicli pari: simula Acqua Pulita
-}
-
 // ── Globals ────────────────────────────────────────────────────────────────
 uint8_t observerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
