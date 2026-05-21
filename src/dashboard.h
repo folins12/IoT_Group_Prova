@@ -1,13 +1,6 @@
 #ifndef DASHBOARD_H
 #define DASHBOARD_H
 
-// The dashboard is served by main.cpp over HTTP on port 80.
-// It uses Server-Sent Events (/api/events) for push notifications —
-// the browser never needs to poll; the server pushes every 400 ms.
-// An alert log panel records every anomaly event with timestamp.
-// A browser Notification API request is made on first load so the
-// user can receive OS-level push alerts even when the tab is in the background.
-
 const char* html_page = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -149,12 +142,10 @@ const char* html_page = R"rawliteral(
 
   <div class="max-w-7xl mx-auto space-y-4">
 
-    <!-- ── Header ────────────────────────────────────────────────────────── -->
     <div class="panel p-4 flex flex-col sm:flex-row justify-between items-center gap-3">
       <div class="flex items-center gap-3">
         <div class="w-10 h-10 rounded-full flex items-center justify-center"
              style="background:rgba(34,211,238,0.1);border:1px solid rgba(34,211,238,0.4);box-shadow:0 0 16px rgba(34,211,238,0.3)">
-          <!-- wave icon -->
           <svg class="w-5 h-5" style="color:var(--c-cyan)" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
               d="M3 12c1.5-3 3-3 4.5 0s3 3 4.5 0 3-3 4.5 0 3 3 4.5 0"/>
@@ -173,7 +164,6 @@ const char* html_page = R"rawliteral(
       </div>
     </div>
 
-    <!-- ── Alert banner (shown only when HALTED) ─────────────────────────── -->
     <div id="alert-banner" style="display:none" class="p-3 flex justify-between items-center gap-3">
       <div class="flex items-center gap-2">
         <svg class="w-5 h-5 shrink-0" style="color:var(--c-red)" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -186,10 +176,8 @@ const char* html_page = R"rawliteral(
       <button onclick="apiCall('/api/reset')" class="btn btn-red" style="width:auto;padding:6px 18px">RESET</button>
     </div>
 
-    <!-- ── Main grid ─────────────────────────────────────────────────────── -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
 
-      <!-- Left column: controls + alert log -->
       <div class="panel p-5 space-y-4 flex flex-col lg:col-span-1">
 
         <div>
@@ -199,7 +187,6 @@ const char* html_page = R"rawliteral(
 
         <div class="space-y-2">
           <button onclick="apiCall('/api/learn')" class="btn btn-amber">① CALIBRATE (LEARN)</button>
-          <button onclick="apiCall('/api/auto')"  id="btn-auto" class="btn btn-purple">② TOGGLE AUTO MODE</button>
         </div>
 
         <div class="divider"></div>
@@ -207,10 +194,8 @@ const char* html_page = R"rawliteral(
 
         <div class="space-y-2">
           <button onclick="apiCall('/api/pump')"  id="btn-pump"  class="btn btn-blue">TOGGLE PUMP</button>
-          <button onclick="apiCall('/api/servo')" id="btn-servo" class="btn btn-green">DISPENSE FOOD</button>
         </div>
 
-        <!-- Alert log -->
         <div style="flex:1">
           <div class="divider"></div>
           <div class="flex justify-between items-center mb-2">
@@ -223,16 +208,13 @@ const char* html_page = R"rawliteral(
         </div>
       </div>
 
-      <!-- Right: metrics + chart -->
       <div class="lg:col-span-3 space-y-4">
 
-        <!-- Sensor metric row — 5 cards -->
         <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
-
           <div class="panel p-4 flex flex-col items-center justify-center">
-            <span class="metric-lbl">Turbidity</span>
-            <span id="val-turb" class="metric-val glow-cyan mt-1">—</span>
-            <span class="metric-lbl">NTU</span>
+            <span class="metric-lbl">Network Latency</span>
+            <span id="val-latency" class="metric-val glow-cyan mt-1" style="font-size: 1.25rem;">—</span>
+            <span class="metric-lbl">ms</span>
           </div>
 
           <div class="panel p-4 flex flex-col items-center justify-center">
@@ -258,10 +240,8 @@ const char* html_page = R"rawliteral(
             <span id="val-ewma" class="metric-val mt-1" style="color:#67e8f9;text-shadow:0 0 12px rgba(103,232,249,0.6)">—</span>
             <span class="metric-lbl">mA smooth</span>
           </div>
-
         </div>
 
-        <!-- Live chart -->
         <div class="panel p-5" style="flex:1">
           <div class="flex justify-between items-center mb-3 flex-wrap gap-2">
             <p class="mono text-xs font-bold tracking-widest" style="color:var(--c-muted)">LIVE POWER SIGNATURE</p>
@@ -285,29 +265,28 @@ const char* html_page = R"rawliteral(
           </div>
         </div>
 
-        <!-- Anomaly algorithm info -->
         <div class="panel p-4 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
           <div>
             <p class="mono font-bold tracking-widest mb-1" style="color:var(--c-muted)">ALGORITHM</p>
-            <p>EWMA + Z-score sliding window</p>
-            <p style="color:var(--c-muted)">α = 0.2 · confirmed at 3 ticks</p>
+            <p>Hampel Filter + Z-score sliding window</p>
+            <p style="color:var(--c-muted)">MAD based · confirmed at 2 ticks</p>
           </div>
           <div>
             <p class="mono font-bold tracking-widest mb-1" style="color:var(--c-muted)">ANOMALY TYPES</p>
-            <p><span style="color:var(--c-red)">●</span> Motor stall  (I_ewma &gt; μ+3σ)</p>
-            <p><span style="color:var(--c-yellow)">●</span> Dry run     (I_ewma &lt; μ−3σ)</p>
-            <p><span style="color:var(--c-orange)">●</span> Voltage drop (&lt;90 % V_base)</p>
+            <p><span style="color:var(--c-red)">●</span> Motor stall  (I_ewma &gt; Med+2.5σ)</p>
+            <p><span style="color:var(--c-yellow)">●</span> Dry run     (I_ewma &lt; μ * 30%)</p>
+            <p><span style="color:var(--c-orange)">●</span> Voltage / Temp out of range</p>
           </div>
           <div>
             <p class="mono font-bold tracking-widest mb-1" style="color:var(--c-muted)">REACTION TIME</p>
-            <p>3 × 400 ms = <span class="glow-cyan">1 200 ms</span> max</p>
+            <p>2 × 200 ms = <span class="glow-cyan">400 ms</span> max</p>
             <p style="color:var(--c-muted)">Req: &lt; 2 000 ms ✓</p>
           </div>
         </div>
 
       </div>
     </div>
-  </div><!-- /max-w -->
+  </div>
 
   <script>
   // ── Chart setup ────────────────────────────────────────────────────────
@@ -391,11 +370,10 @@ const char* html_page = R"rawliteral(
   function sendNotification(title, body) {
     if (notifGranted) new Notification(title, { body, icon: '/favicon.ico' });
   }
-  // Auto-request on load (modern browsers require user gesture — the badge covers that)
 
-  // ── SSE  — Server-Sent Events for push data ────────────────────────────
-  // The server pushes a JSON event every ~400 ms.
-  // This eliminates polling and enables instant alert delivery.
+  // ── SSE Server-Sent Events ─────────────────────────────────────────────
+  let lastEspTime = 0;
+  let lastBrowserTime = 0;
   let lastStatus = '';
   const evtSource = new EventSource('/api/events');
 
@@ -403,12 +381,26 @@ const char* html_page = R"rawliteral(
     let d;
     try { d = JSON.parse(e.data); } catch(_) { return; }
 
+    // ── Latenza di Rete ──
+    if (d.timestamp) {
+        const currentBrowserTime = Date.now();
+        if (lastEspTime !== 0 && lastBrowserTime !== 0) {
+            const espDelta = d.timestamp - lastEspTime; 
+            const browserDelta = currentBrowserTime - lastBrowserTime; 
+            let networkLatency = browserDelta - espDelta;
+            if(networkLatency < 0) networkLatency = 0;
+            if(networkLatency > 2000) networkLatency = ">2000"; 
+            document.getElementById('val-latency').textContent = networkLatency;
+        }
+        lastEspTime = d.timestamp;
+        lastBrowserTime = currentBrowserTime;
+    }
+
     // ── Metrics ──
     if (d.current   != null) document.getElementById('val-curr').textContent = d.current.toFixed(1);
     if (d.ewma      != null) document.getElementById('val-ewma').textContent = d.ewma.toFixed(1);
     if (d.voltage   != null) document.getElementById('val-volt').textContent = d.voltage.toFixed(2);
     if (d.temp      != null) document.getElementById('val-temp').textContent = d.temp.toFixed(1);
-    if (d.turbidity != null) document.getElementById('val-turb').textContent = Number(d.turbidity).toFixed(0);
     if (d.th_stall  != null) document.getElementById('val-stall').textContent = d.th_stall > 0 ? d.th_stall.toFixed(1) : '—';
     if (d.th_dry    != null) document.getElementById('val-dry').textContent   = d.th_dry   > 0 ? d.th_dry.toFixed(1)   : '—';
 
@@ -425,15 +417,7 @@ const char* html_page = R"rawliteral(
     badge.textContent = s;
     badge.className = 'badge badge-' + s.toLowerCase();
 
-    // ── Auto-mode badge ──
-    const autoBadge = document.getElementById('auto-badge');
-    const btnAuto   = document.getElementById('btn-auto');
-    autoBadge.style.display = d.auto_mode ? 'inline-block' : 'none';
-    autoBadge.className = d.auto_mode ? 'badge badge-monitoring' : 'badge badge-idle';
-    btnAuto.textContent = d.auto_mode ? '② STOP AUTO MODE' : '② TOGGLE AUTO MODE';
-    btnAuto.className   = d.auto_mode ? 'btn btn-red' : 'btn btn-purple';
-
-    // ── Alert banner & push notification on status change ──
+    // ── Alert banner & push notification ──
     const alertBanner = document.getElementById('alert-banner');
     if (s === 'HALTED') {
       alertBanner.style.display = 'flex';
@@ -454,16 +438,6 @@ const char* html_page = R"rawliteral(
       if (s === 'IDLE' && lastStatus === 'LEARNING') addLog('INFO', 'Calibration complete');
       lastStatus = s;
     }
-
-    // ── Pump button ──
-    const btnPump = document.getElementById('btn-pump');
-    if (d.pump) {
-      btnPump.textContent = 'TURN PUMP OFF';
-      btnPump.className = 'btn btn-red';
-    } else {
-      btnPump.textContent = 'TURN PUMP ON';
-      btnPump.className = 'btn btn-blue';
-    }
   };
 
   evtSource.onerror = function() {
@@ -473,6 +447,20 @@ const char* html_page = R"rawliteral(
   async function apiCall(endpoint) {
     try { await fetch(endpoint, { method: 'POST' }); }
     catch(e) { addLog('WARN', 'API error: ' + endpoint); }
+  }
+
+  // ── Integrazione Sensori Smartphone (Ground Truth / CrowdSensing L21) ──
+  if ('Accelerometer' in window) {
+    try {
+      const accel = new Accelerometer({ frequency: 10 });
+      accel.addEventListener('reading', () => {
+        const mag = Math.sqrt(accel.x**2 + accel.y**2 + accel.z**2);
+        if (mag > 15.0) {  // soglia shock/vibrazione forte in m/s²
+          addLog('WARN', `Uto/Vibrazione rilevata dalla vasca: ${mag.toFixed(1)} m/s²`);
+        }
+      });
+      accel.start();
+    } catch(e) { console.warn('Accelerometer non supportato:', e); }
   }
   </script>
 </body>
