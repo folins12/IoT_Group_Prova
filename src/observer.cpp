@@ -1,6 +1,19 @@
 /*
  * FLOAT - Observer Node
  * =====================
+ * Reads motor current via INA219, detects anomalies using EWMA + Hampel filter,
+ * and communicates with the Target node over ESP-NOW (channel 13).
+ *
+ * Anomaly types: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP, TEMP_OUT_OF_RANGE
+ *
+ * Changes vs previous version:
+ *   - Temperature guard: invalid readings (< -10 °C) are discarded; last
+ *     valid temperature is kept to prevent false TEMP_OUT_OF_RANGE alarms
+ *   - EWMA is reset to current raw value when grace period ends, preventing
+ *     motor inrush current from carrying over into monitoring
+ *   - Hampel filter replaces robustStats for robust baseline calibration
+ *   - ACK handshake: replies ACK:N when a message with |ID:N| is received
+ *   - DRY_RUN threshold: 30 % of baseline mean current
  */
 
 #include <Arduino.h>
@@ -8,7 +21,7 @@
 #include <Adafruit_INA219.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h> // <--- AGGIUNTA: Necessaria per il controllo avanzato della radio
+#include <esp_wifi.h>  // Required for advanced radio control
 #include <math.h>
 
 // ── Pin map ────────────────────────────────────────────────────────────────
@@ -17,10 +30,10 @@ const int I2C_SCL     = 42;
 const int BUZZER_PIN  = 7;
 
 // ── Hardware ───────────────────────────────────────────────────────────────
-Adafruit_INA219   ina219;
+Adafruit_INA219 ina219;
 
-// ── ESP-NOW peer (broadcast — replaced at runtime with real MAC if needed) ─
-uint8_t targetAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// ── ESP-NOW peer (Target node MAC address) ────────────────────────────────
+uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
 
 // ── System state ───────────────────────────────────────────────────────────
 String  current_mode   = "IDLE";    // IDLE | LEARNING | MONITORING
@@ -31,32 +44,35 @@ String  anomaly_reason = "NONE";
 const int  MAX_SAMPLES = 60;
 float      samples[MAX_SAMPLES];
 int        sample_idx  = 0;
-int grace_period = 0;
+int        grace_period = 0;
 
-float baseline_mean    = 0.0f;
-float baseline_std     = 0.0f;
-float th_stall         = 0.0f;  // μ + 3σ
-float th_volt_min      = 0.0f;  // minimum healthy bus voltage
-float th_dry_run       = 0.0f;  // §7A: 30% di baseline_mean
-bool  is_calibrated    = false;
+float baseline_mean = 0.0f;
+float baseline_std  = 0.0f;
+float th_stall      = 0.0f;  // stall threshold: μ + 3σ
+float th_volt_min   = 0.0f;  // minimum healthy bus voltage (90 % of calibration voltage)
+float th_dry_run    = 0.0f;  // dry-run threshold: 30 % of baseline mean
+bool  is_calibrated = false;
 
-// ── Soglie temperatura (§4) ────────────────────────────────────────────────
+// ── Temperature limits ─────────────────────────────────────────────────────
 const float TEMP_MIN_C = 18.0f;
-const float TEMP_MAX_C = 32.0f;
+const float TEMP_MAX_C = 30.0f;
 
 // ── EWMA state ─────────────────────────────────────────────────────────────
-const float EWMA_ALPHA = 0.2f;  // smoothing factor  (0 = no update, 1 = raw)
+// Exponential Weighted Moving Average: smooths out instantaneous current spikes.
+// Formula: ewma = α × raw + (1-α) × ewma_prev   (α=0.2 → strong smoothing)
+const float EWMA_ALPHA   = 0.2f;
 float       ewma_current = 0.0f;
 bool        ewma_init    = false;
 
 // ── Anomaly confirmation counter ───────────────────────────────────────────
+// An anomaly must be detected on CONFIRM_NEEDED consecutive ticks before halting.
 int anomaly_confirm = 0;
 const int CONFIRM_NEEDED = 3;
 
 // ── Latest sensor readings (forwarded to dashboard node) ──────────────────
 float last_current  = 0.0f;
 float last_voltage  = 0.0f;
-float last_temp_c   = 25.0f;
+float last_temp_c   = 25.0f;  // default; updated from Target DATA:SENSOR messages
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -70,9 +86,12 @@ void computeStats(float* arr, int n, float& mean, float& std_dev) {
     std_dev = sqrtf(sq / n);
 }
 
-// ── Hampel helpers (§1 – sostituisce robustStats) ─────────────────────────
-// Usa MAD (Median Absolute Deviation) invece della 3σ classica:
-// robusta agli outlier per costruzione, non distorce la baseline.
+// ── Hampel filter (replaces robustStats) ──────────────────────────────────
+// Uses Median Absolute Deviation (MAD) instead of the classical 3σ rule.
+// Robust to outliers by construction: baseline is not skewed by spikes.
+//   MAD = median( |xᵢ - median(x)| )
+//   σ_hampel = 1.4826 × MAD   (consistent estimator for normal distributions)
+//   outlier if |xᵢ - median| > k × σ_hampel   (k = 3 standard)
 
 float arrayMedian(float* arr, int n) {
     float buf[n];
@@ -95,8 +114,9 @@ void hampelStats(float* arr, int n, float k_sigma,
     for (int i = 0; i < n; i++) devs[i] = fabsf(arr[i] - med);
 
     float mad     = arrayMedian(devs, n);
-    float sigma_h = 1.4826f * mad;   // stimatore consistente di σ
+    float sigma_h = 1.4826f * mad;   // consistent estimator of σ
 
+    // Keep only inliers: samples within k_sigma × sigma_h of the median
     float sum = 0.0f; float sq = 0.0f; int cnt = 0;
     for (int i = 0; i < n; i++) {
         if (sigma_h < 1e-6f || fabsf(arr[i] - med) <= k_sigma * sigma_h) {
@@ -123,18 +143,18 @@ void buzzerAlert(int times) {
     }
 }
 
-// ── ESP-NOW receive callback ────────────────────────────────────────────────
+// ── ESP-NOW receive callback ───────────────────────────────────────────────
 void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     char msg[len + 1];
     memcpy(msg, data, len);
     msg[len] = '\0';
     String s(msg);
 
-    // §2 – ACK handshake: se il messaggio contiene |ID:N|, risponde ACK:N al mittente
+    // ACK handshake: if message contains |ID:N|, reply ACK:N to the sender
     int id_pos = s.indexOf("|ID:");
     if (id_pos != -1) {
         uint32_t msg_id = (uint32_t)s.substring(id_pos + 4).toInt();
-        s = s.substring(0, id_pos);   // tronca il suffisso prima del parsing
+        s = s.substring(0, id_pos);   // strip the ID suffix before routing
         char ack_buf[32];
         snprintf(ack_buf, sizeof(ack_buf), "ACK:%lu", (unsigned long)msg_id);
         esp_now_send(mac, (const uint8_t*)ack_buf, strlen(ack_buf));
@@ -142,12 +162,22 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
     if (s.startsWith("LOG:")) {
         Serial.println(s.substring(4));
+
     } else if (s.startsWith("DATA:SENSOR:")) {
-        String payload = s.substring(12);
-        int commaIndex = payload.indexOf(','); 
+        // Format: DATA:SENSOR:<turbidity>,<temperature>
+        String payload    = s.substring(12);
+        int    commaIndex = payload.indexOf(',');
         if (commaIndex != -1) {
-            last_temp_c = payload.substring(commaIndex + 1).toFloat();
+            float received_temp = payload.substring(commaIndex + 1).toFloat();
+            // Guard: DS18B20 returns -127 °C on disconnect — discard and keep last valid value
+            if (received_temp > -10.0f) {
+                last_temp_c = received_temp;
+            } else {
+                Serial.printf("[OBS] WARNING: invalid temperature %.1f °C received — keeping last valid: %.1f °C\n",
+                              received_temp, last_temp_c);
+            }
         }
+
     } else if (s == "CMD:START_LEARN") {
         current_mode  = "LEARNING";
         sample_idx    = 0;
@@ -156,42 +186,42 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
     } else if (s == "CMD:START_MONITOR") {
         if (!is_calibrated) {
-            Serial.println("[OBS] WARNING: Not calibrated yet — monitoring skipped");
+            Serial.println("[OBS] WARNING: not calibrated yet — monitoring skipped");
             return;
         }
         current_mode    = "MONITORING";
         anomaly_confirm = 0;
-        ewma_init       = false; 
-        grace_period = 4;
+        ewma_init       = false;   // EWMA will be seeded from first real reading
+        grace_period    = 4;
         Serial.println("[OBS] MODE → MONITORING");
 
     } else if (s == "CMD:STOP_MEASURE") {
-            if (current_mode == "LEARNING" && sample_idx > 5) {
-                float clean_mean, clean_std;
-                hampelStats(samples, sample_idx, 3.0f, clean_mean, clean_std); // §1
+        if (current_mode == "LEARNING" && sample_idx > 5) {
+            float clean_mean, clean_std;
+            hampelStats(samples, sample_idx, 3.0f, clean_mean, clean_std);
 
-                baseline_mean = clean_mean;
-                baseline_std  = clean_std;
-                th_stall    = baseline_mean + (3.0f * baseline_std);
-                if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
-                th_volt_min = last_voltage * 0.90f;
-                th_dry_run  = baseline_mean * 0.30f;  // §7A: 30% del consumo normale
-                is_calibrated = true;
+            baseline_mean = clean_mean;
+            baseline_std  = clean_std;
+            th_stall      = baseline_mean + (3.0f * baseline_std);
+            if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
+            th_volt_min   = last_voltage * 0.90f;
+            th_dry_run    = baseline_mean * 0.30f;  // 30 % of normal running current
+            is_calibrated = true;
 
-                Serial.println("\n[OBS] ══ Calibration Complete (EWMA + Hampel) ══");
-                Serial.printf("   Samples   : %d\n",              sample_idx);
-                Serial.printf("   μ (mean)  : %.2f mA\n",         baseline_mean);
-                Serial.printf("   σ (std)   : %.2f mA\n",         baseline_std);
-                Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
-                Serial.printf("   Dry-run   : %.2f mA  (30%% μ)\n",  th_dry_run);
-                Serial.printf("   Volt min  : %.2f V\n",           th_volt_min);
+            Serial.println("\n[OBS] ══ Calibration complete (EWMA + Hampel) ══");
+            Serial.printf("   Samples   : %d\n",               sample_idx);
+            Serial.printf("   mean (μ)  : %.2f mA\n",          baseline_mean);
+            Serial.printf("   std  (σ)  : %.2f mA\n",          baseline_std);
+            Serial.printf("   Stall thr : %.2f mA  (μ + 3σ)\n", th_stall);
+            Serial.printf("   Dry-run   : %.2f mA  (30%% μ)\n",  th_dry_run);
+            Serial.printf("   Volt min  : %.2f V\n",            th_volt_min);
 
-                char buf[160];
-                snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f,%.2f",
-                         baseline_mean, baseline_std, th_stall, th_dry_run);
-                espNowSend(buf);
-            }
-            current_mode = "IDLE";
+            char buf[160];
+            snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f,%.2f",
+                     baseline_mean, baseline_std, th_stall, th_dry_run);
+            espNowSend(buf);
+        }
+        current_mode = "IDLE";
 
     } else if (s == "CMD:RESET") {
         system_locked   = false;
@@ -200,16 +230,16 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         ewma_init       = false;
         current_mode    = "IDLE";
         digitalWrite(BUZZER_PIN, LOW);
-        Serial.println("[OBS] System RESET by dashboard command");
+        Serial.println("[OBS] System reset by dashboard command");
     }
 }
 
 // ── setup ──────────────────────────────────────────────────────────────────
 void setup() {
-    delay(3000); 
-    Serial.println("\n\n[SISTEMA] Seriale Connessa! Avvio boot...");
-
+    delay(3000);
     Serial.begin(115200);
+    Serial.println("\n\n[SYS] Serial connected. Booting...");
+
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
@@ -222,16 +252,14 @@ void setup() {
         while (1) delay(100);
     }
 
-    // --- MODIFICA 1 E 2: BLOCCO CANALE E POTENZA MASSIMA ---
+    // Lock channel 13 and set maximum TX power before ESP-NOW init
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    
-    WiFi.setTxPower(WIFI_POWER_19_5dBm); // Potenza massima
-    
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE); // Tunnel sul canale 13
+    esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
-    // -------------------------------------------------------
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[OBS] ESP-NOW init failed");
@@ -242,13 +270,13 @@ void setup() {
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(peer));
     memcpy(peer.peer_addr, targetAddress, 6);
-    peer.channel = 13; // <-- Deve seguire il canale forzato
+    peer.channel = 13;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
 
     Serial.println("\n╔══════════════════════════════════════════════╗");
-    Serial.println("║  FLOAT  –  Observer Node (v3)               ║");
-    Serial.println("║  Anomaly: EWMA + Hampel + DRY_RUN + TEMP    ║");
+    Serial.println("║  FLOAT  –  Observer Node (v4)               ║");
+    Serial.println("║  EWMA + Hampel | DRY_RUN | TEMP guard       ║");
     Serial.println("╚══════════════════════════════════════════════╝");
 }
 
@@ -257,6 +285,7 @@ void loop() {
     float raw_current = ina219.getCurrent_mA();
     float bus_voltage = ina219.getBusVoltage_V();
 
+    // INA219 recovery: reset I2C bus if reading is clearly invalid
     if (raw_current > 3000.0f || isnan(raw_current)) {
         Wire.end(); delay(10);
         Wire.setPins(I2C_SDA, I2C_SCL); Wire.begin(); Wire.setClock(100000);
@@ -268,6 +297,7 @@ void loop() {
     last_current = max(0.0f, raw_current);
     last_voltage = max(0.0f, bus_voltage);
 
+    // Update EWMA — seeded with raw value on first reading after reset
     if (!ewma_init) {
         ewma_current = last_current;
         ewma_init    = true;
@@ -275,37 +305,54 @@ void loop() {
         ewma_current = EWMA_ALPHA * last_current + (1.0f - EWMA_ALPHA) * ewma_current;
     }
 
+    // ── HALTED state ───────────────────────────────────────────────────────
     if (system_locked) {
-        Serial.printf("[HALT] Locked. I=%.1f mA  V=%.2f V  T=%.1f°C\n", last_current, last_voltage, last_temp_c);
+        Serial.printf("[HALT] Locked. I=%.1f mA  V=%.2f V  T=%.1f C\n",
+                      last_current, last_voltage, last_temp_c);
         char buf[128];
-        snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,HALTED,%s", last_current, last_voltage, last_temp_c, anomaly_reason.c_str());
+        snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,HALTED,%s",
+                 last_current, last_voltage, last_temp_c, anomaly_reason.c_str());
         espNowSend(buf);
         buzzerAlert(1);
         delay(5000);
         return;
     }
 
+    // ── LEARNING mode ─────────────────────────────────────────────────────
     if (current_mode == "LEARNING") {
         if (last_current > 50.0f && sample_idx < MAX_SAMPLES) {
             samples[sample_idx++] = last_current;
-            Serial.printf("   [LEARN] #%d  I=%.2f mA  V=%.2f V\n", sample_idx, last_current, last_voltage);
+            Serial.printf("   [LEARN] #%d  I=%.2f mA  V=%.2f V\n",
+                          sample_idx, last_current, last_voltage);
         }
         delay(300);
         return;
     }
 
+    // ── MONITORING mode ───────────────────────────────────────────────────
     if (current_mode == "MONITORING" && is_calibrated) {
+
+        // Grace period: ignore alarms during motor inrush (first few ticks)
         if (grace_period > 0) {
             grace_period--;
-            Serial.printf("   [MON] SPUNTO MOTORE (ignoro allarmi)... I_raw=%.1f mA\n", last_current);
+            Serial.printf("   [MON] Motor inrush — alarms suppressed (%d left)  I_raw=%.1f mA\n",
+                          grace_period, last_current);
+            // On the last grace tick, re-seed EWMA from current raw value
+            // to prevent inrush current from carrying into anomaly detection
+            if (grace_period == 0) {
+                ewma_current = last_current;
+                Serial.printf("   [MON] Grace period ended — EWMA seeded at %.1f mA\n", ewma_current);
+            }
             delay(400);
-            return; 
+            return;
         }
-        float z_score   = (baseline_std > 1e-6f) ? (ewma_current - baseline_mean) / baseline_std : 0.0f;
+
+        float z_score   = (baseline_std > 1e-6f)
+                          ? (ewma_current - baseline_mean) / baseline_std : 0.0f;
         bool stall_flag = (ewma_current > th_stall);
         bool volt_flag  = (th_volt_min > 0.1f && last_voltage < th_volt_min);
-        bool dry_flag   = (th_dry_run  > 0.1f && ewma_current < th_dry_run);   // §7A
-        bool temp_flag  = (last_temp_c < TEMP_MIN_C || last_temp_c > TEMP_MAX_C); // §4
+        bool dry_flag   = (th_dry_run  > 0.1f && ewma_current < th_dry_run);
+        bool temp_flag  = (last_temp_c < TEMP_MIN_C || last_temp_c > TEMP_MAX_C);
         bool anomaly    = stall_flag || volt_flag || dry_flag || temp_flag;
 
         Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f  [%d/%d]%s%s%s%s\n",
@@ -319,22 +366,18 @@ void loop() {
         if (anomaly) {
             anomaly_confirm++;
             if (anomaly_confirm >= CONFIRM_NEEDED) {
-                // Priorità: stall > dry-run > tensione > temperatura
+                // Priority: stall > dry-run > voltage drop > temperature
                 if      (stall_flag) anomaly_reason = "MOTOR_STALL";
                 else if (dry_flag)   anomaly_reason = "DRY_RUN";
                 else if (volt_flag)  anomaly_reason = "VOLTAGE_DROP";
                 else                 anomaly_reason = "TEMP_OUT_OF_RANGE";
 
                 Serial.printf("\n[!!!] ANOMALY CONFIRMED: %s\n", anomaly_reason.c_str());
-                Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V  T=%.1f°C\n",
+                Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V  T=%.1f C\n",
                               ewma_current, z_score, last_voltage, last_temp_c);
 
-                // --- MODIFICA 3: RAFFICA DI EMERGENZA (Anti-Interferenze) ---
-                for (int i = 0; i < 10; i++) {
-                    espNowSend("HALT");
-                    delay(5);
-                }
-                // ------------------------------------------------------------
+                // Emergency burst: send HALT 10 times to overcome RF interference
+                for (int i = 0; i < 10; i++) { espNowSend("HALT"); delay(5); }
 
                 char alert[64];
                 snprintf(alert, sizeof(alert), "ALERT:%s", anomaly_reason.c_str());
@@ -348,16 +391,20 @@ void loop() {
         }
 
         char buf[128];
-        snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,MONITORING,OK", last_current, last_voltage, last_temp_c);
+        snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,MONITORING,OK",
+                 last_current, last_voltage, last_temp_c);
         espNowSend(buf);
 
         delay(400);
         return;
     }
 
-    Serial.printf("[IDLE] I=%.2f mA  V=%.2f V  T=%.1f°C\n", last_current, last_voltage, last_temp_c);
+    // ── IDLE ──────────────────────────────────────────────────────────────
+    Serial.printf("[IDLE] I=%.2f mA  V=%.2f V  T=%.1f C\n",
+                  last_current, last_voltage, last_temp_c);
     char buf[128];
-    snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,IDLE,OK", last_current, last_voltage, last_temp_c);
+    snprintf(buf, sizeof(buf), "TELEM:%.2f,%.2f,%.2f,IDLE,OK",
+             last_current, last_voltage, last_temp_c);
     espNowSend(buf);
 
     delay(2000);

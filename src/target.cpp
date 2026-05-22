@@ -1,17 +1,21 @@
 /*
  * FLOAT - Target Node
  * ====================
- * Misura torbidità + temperatura, pilota pompa e servo alimentatore.
- * Comunica via ESP-NOW (canale 13) con l'Observer.
- * Anomalie rilevate dall'Observer: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP,
+ * Measures turbidity + temperature, drives pump and food servo.
+ * Communicates via ESP-NOW (channel 13) with the Observer node.
+ * Anomalies detected by Observer: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP,
  *   TEMP_OUT_OF_RANGE, PERIODIC_STALL, COMMUNICATION_LOSS.
  *
- * Modifiche rispetto alla versione precedente:
- *   - ACK / retry con backoff sui comandi critici
- *   - readTurbidityNTU riceve la temperatura per correzione viscosità
- *   - Torbidità letta PRIMA di accendere il WiFi (ADC stabile)
- *   - Contatori RTC per anomalie ricorrenti e mancate comunicazioni
- *   - Deep-sleep alzato a 20 s → duty cycle ~9 %  (91 % sleep)
+ * Changes vs previous version:
+ *   - Temperature guard in monitoring loop: -127 °C (DS18B20 disconnect)
+ *     is discarded and replaced with last valid reading
+ *   - Turbidity value is randomised on every boot (demo / test mode)
+ *   - Clean water action: servo dispenses food AND pump runs for 5 s
+ *   - ACK / retry with exponential backoff on critical commands
+ *   - Turbidity read BEFORE WiFi init (stable ADC, no RF interference)
+ *   - RTC counters for recurring anomalies and missed ACKs
+ *   - Deep sleep raised to 20 s → duty cycle ~9 % (91 % sleep)
+ *   - All comments translated to English
  */
 
 #include <Arduino.h>
@@ -32,22 +36,23 @@ const int DS18B20_PIN   = 4;
 // ── Turbidity sensor calibration ──────────────────────────────────────────
 const int   TURB_CLEAN_ADC     = 3435;
 const int   TURB_DIRTY_ADC     = 1200;
-const float TURB_MAX_NTU       = 3000.0f;
-const float TURB_THRESHOLD_NTU = 100.0f;
+const float TURB_MAX_NTU       = 800.0f;
+const float TURB_THRESHOLD_NTU = 50.0f;
 
 // ── Deep-sleep period ─────────────────────────────────────────────────────
 // 20 s → active ≈ 2 s / 22 s = 9 %  → 91 % sleep ✓
 const uint64_t SLEEP_US = 20ULL * 1000000ULL;
 
 // ── RTC-persistent state (survives deep sleep) ─────────────────────────────
-RTC_DATA_ATTR int      bootCount            = 0;
-RTC_DATA_ATTR bool     system_halted        = false;
-RTC_DATA_ATTR uint32_t last_cmd_id          = 0;   // per de-duplicazione ACK
-RTC_DATA_ATTR int      consecutive_noack    = 0;   // comunicazioni fallite consecutive
-RTC_DATA_ATTR int      anomaly_count        = 0;   // anomalie totali per rilevare PERIODIC_STALL
+RTC_DATA_ATTR int      bootCount         = 0;
+RTC_DATA_ATTR bool     system_halted     = false;
+RTC_DATA_ATTR uint32_t last_cmd_id       = 0;   // for ACK de-duplication
+RTC_DATA_ATTR int      consecutive_noack = 0;   // consecutive failed ACKs
+RTC_DATA_ATTR int      anomaly_count     = 0;   // total anomalies for PERIODIC_STALL
+RTC_DATA_ATTR float    last_valid_temp   = 20.0f;
 
 // ── Globals ────────────────────────────────────────────────────────────────
-uint8_t observerAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60};
 
 volatile bool     emergency_stop = false;
 volatile bool     ack_received   = false;
@@ -74,16 +79,16 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 }
 
-// ── sendMsg – fire and forget (telemetria, log) ────────────────────────────
+// ── sendMsg – fire and forget (telemetry, logs) ────────────────────────────
 void sendMsg(const String& type, const String& content) {
     String full = type + ":" + content;
     esp_now_send(observerAddress, (const uint8_t*)full.c_str(), full.length());
     delay(150);
 }
 
-// ── sendMsgWithACK – comandi critici con retry + backoff ──────────────────
-//   Aggiunge "|ID:N" al messaggio; l'Observer risponde "ACK:N".
-//   Ritorna true se l'ACK è ricevuto entro (retries × timeout_ms).
+// ── sendMsgWithACK – critical commands with retry + backoff ───────────────
+// Appends "|ID:N" to the message; Observer replies "ACK:N".
+// Returns true if ACK received within (retries × timeout_ms).
 bool sendMsgWithACK(const String& type, const String& content,
                     int retries = 5, int timeout_ms = 300) {
     last_cmd_id++;
@@ -96,12 +101,12 @@ bool sendMsgWithACK(const String& type, const String& content,
         unsigned long t0 = millis();
         while (millis() - t0 < (unsigned long)timeout_ms) {
             if (ack_received && acked_id == last_cmd_id) {
-                consecutive_noack = 0;   // reset contatore fallimenti
+                consecutive_noack = 0;  // reset failure counter
                 return true;
             }
             delay(10);
         }
-        delay(50 * (attempt + 1));   // backoff esponenziale
+        delay(50 * (attempt + 1));  // exponential backoff
     }
 
     consecutive_noack++;
@@ -111,18 +116,17 @@ bool sendMsgWithACK(const String& type, const String& content,
 }
 
 // ── readTurbidityNTU ───────────────────────────────────────────────────────
-//   Legge l'ADC con WiFi OFF per evitare interferenze RF.
-//   Applica correzione di viscosità in funzione della temperatura.
-//   Chiamare PRIMA di WiFi.mode(WIFI_STA) / esp_now_init().
+// Reads ADC with WiFi OFF to avoid RF interference.
+// Applies a viscosity temperature correction.
+// Must be called BEFORE WiFi.mode(WIFI_STA) / esp_now_init().
 float readTurbidityNTU(float temp_c = 25.0f) {
-    // Lettura ADC con media su 64 campioni
     long sum = 0;
     for (int i = 0; i < 64; i++) {
         sum += analogRead(TURBIDITY_PIN);
         delay(2);
     }
     int adc = (int)(sum / 64);
-    Serial.printf("[SENSOR] ADC Torbidità (raw): %d\n", adc);
+    Serial.printf("[SENSOR] Turbidity ADC (raw): %d\n", adc);
 
     adc = constrain(adc, TURB_DIRTY_ADC, TURB_CLEAN_ADC);
 
@@ -130,16 +134,35 @@ float readTurbidityNTU(float temp_c = 25.0f) {
                     (float)(TURB_CLEAN_ADC - adc) /
                     (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
 
-    // Correzione temperatura: viscosità dell'acqua cala con T.
-    // La velocità di sedimentazione delle particelle aumenta → lettura NTU
-    // apparentemente più bassa a T alta. Correzione lineare ±0.5 %/°C.
+    // Temperature correction: water viscosity decreases with temperature,
+    // making particles settle faster → apparently lower NTU at high T.
+    // Linear correction ±0.5 %/°C referenced to 25 °C.
     float temp_correction = 1.0f + 0.005f * (temp_c - 25.0f);
     float ntu = ntu_raw / temp_correction;
 
     return constrain(ntu, 0.0f, TURB_MAX_NTU);
 }
 
-// ── servoMove – generazione PWM software ──────────────────────────────────
+// ── readTurbidityRandom ────────────────────────────────────────────────────
+// Returns a random NTU value for demo / testing purposes.
+// Alternates between a "dirty" range and a "clean" range each boot.
+float readTurbidityRandom() {
+    // Seed with a mix of boot count and a free-running timer
+    randomSeed(esp_random());
+    // Alternate boots: even → dirty water, odd → clean water
+    float ntu;
+    if (bootCount % 2 == 0) {
+        // Dirty: 150–2500 NTU (above threshold → pump ON)
+        ntu = random(51, 800);
+    } else {
+        // Clean: 10–80 NTU (below threshold → servo + pump)
+        ntu = random(0, 50);
+    }
+    Serial.printf("[SENSOR] Turbidity (random demo): %.1f NTU\n", ntu);
+    return ntu;
+}
+
+// ── servoMove – software PWM ──────────────────────────────────────────────
 void servoMove(int us, int pulses) {
     for (int i = 0; i < pulses; i++) {
         digitalWrite(SERVO_PIN, HIGH);
@@ -149,14 +172,27 @@ void servoMove(int us, int pulses) {
     }
 }
 
-// ── goToSleep – helper unico per il deep sleep ────────────────────────────
+// ── goToSleep – single deep-sleep entry point ─────────────────────────────
 void goToSleep(uint64_t duration_us = SLEEP_US) {
     bootCount++;
-    sendMsg("LOG", "[SLEEP] Deep sleep " + String((unsigned long)(duration_us / 1000000UL)) + " s...");
+    sendMsg("LOG", "[SLEEP] Deep sleep " +
+            String((unsigned long)(duration_us / 1000000UL)) + " s...");
     delay(200);
     WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup(duration_us);
     esp_deep_sleep_start();
+}
+
+// ── safeTemp – validate DS18B20 reading ───────────────────────────────────
+// Returns the reading if valid; otherwise keeps last_valid_temp unchanged
+// and returns it. -127 °C is the DS18B20 disconnect sentinel.
+float safeTemp(float raw) {
+    if (raw == DEVICE_DISCONNECTED_C || raw < -10.0f) {
+        Serial.printf("[WARN] Invalid temperature %.1f C — using last valid: %.1f C\n", raw, last_valid_temp);
+        return last_valid_temp;
+    }
+    last_valid_temp = raw;
+    return raw;
 }
 
 // ── setup ──────────────────────────────────────────────────────────────────
@@ -171,32 +207,32 @@ void setup() {
     digitalWrite(PUMP_PIN,  LOW);
     digitalWrite(SERVO_PIN, LOW);
 
-    // ── Sistema bloccato per anomalia critica ──────────────────────────────
+    // ── System halted by a critical anomaly ───────────────────────────────
     if (system_halted) {
         Serial.println("[TGT] System halted — staying in deep sleep.");
         esp_sleep_enable_timer_wakeup(SLEEP_US);
         esp_deep_sleep_start();
     }
 
-    // ── Lettura DS18B20 (prima del WiFi per non perdere slot conversione) ──
+    // ── DS18B20 reading (before WiFi to avoid losing conversion window) ───
     tempSensor.begin();
     tempSensor.setResolution(11);
     tempSensor.setWaitForConversion(false);
     tempSensor.requestTemperatures();
-    delay(400);   // attesa conversione 11 bit
+    delay(400);  // wait for 11-bit conversion
 
-    float water_temp = tempSensor.getTempCByIndex(0);
-    if (water_temp == DEVICE_DISCONNECTED_C || water_temp < -10.0f)
-        water_temp = 25.0f;   // fallback sicuro
+    float water_temp = safeTemp(tempSensor.getTempCByIndex(0));
 
-    // ── Lettura torbidità con WiFi OFF ─────────────────────────────────────
-    // ADC è sensibile alle interferenze RF; leggere prima di accendere il radio.
-    float turbidity_ntu = readTurbidityNTU(water_temp);
+    // ── Turbidity reading with WiFi OFF ───────────────────────────────────
+    // ADC is sensitive to RF noise; read before enabling the radio.
+    // NOTE: using randomised value for demo purposes (see readTurbidityRandom)
+    float turbidity_ntu = readTurbidityRandom();
     int   turbidity_pct = (int)((turbidity_ntu / TURB_MAX_NTU) * 100.0f);
 
-    // ── Inizializzazione WiFi + ESP-NOW ────────────────────────────────────
+    // ── WiFi + ESP-NOW init ───────────────────────────────────────────────
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
     esp_wifi_set_promiscuous(true);
@@ -216,56 +252,53 @@ void setup() {
         goToSleep();
     }
 
-    delay(2000);   // pausa per stabilizzazione link ESP-NOW
+    delay(2000);  // allow ESP-NOW link to stabilise
 
-    // ── Invio dati iniziali (fire and forget) ──────────────────────────────
+    // ── Send initial data (fire and forget) ───────────────────────────────
     sendMsg("LOG", "────────────────────────────────────");
     sendMsg("LOG", "[BOOT] #" + String(bootCount));
     sendMsg("LOG", "[SENSOR] Turbidity : " + String(turbidity_ntu, 1) +
             " NTU  (" + String(turbidity_pct) + "%)");
-    sendMsg("LOG", "[SENSOR] Water Temp: " + String(water_temp, 1) + " C");
+    sendMsg("LOG", "[SENSOR] Water temp: " + String(water_temp, 1) + " C");
     sendMsg("DATA", "SENSOR:" + String(turbidity_ntu, 1) +
             "," + String(water_temp, 1));
 
-    // ── Rilevazione PERIODIC_STALL ─────────────────────────────────────────
+    // ── PERIODIC_STALL detection ──────────────────────────────────────────
     if (anomaly_count >= 3) {
-        sendMsg("LOG", "[WARN] PERIODIC_STALL: anomalia ricorrente (" +
-                String(anomaly_count) + " eventi). Possibile ostruzione parziale.");
+        sendMsg("LOG", "[WARN] PERIODIC_STALL: recurring anomaly (" +
+                String(anomaly_count) + " events). Possible partial obstruction.");
         sendMsg("CMD", "PERIODIC_STALL");
     }
 
-    // ── Rilevazione COMMUNICATION_LOSS ────────────────────────────────────
+    // ── COMMUNICATION_LOSS detection ──────────────────────────────────────
     if (consecutive_noack >= 3) {
-        sendMsg("LOG", "[CRITICAL] COMMUNICATION_LOSS: Observer irraggiungibile. Safe mode.");
-        // Sleep lungo in safe mode: riduce consumo senza bloccarsi
-        goToSleep(60ULL * 1000000ULL);
+        sendMsg("LOG", "[CRITICAL] COMMUNICATION_LOSS: Observer unreachable. Safe mode.");
+        goToSleep(60ULL * 1000000ULL);  // long sleep, reduce power without hard-halting
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // LOGICA PRINCIPALE
+    // MAIN LOGIC
     // ══════════════════════════════════════════════════════════════════════
 
     if (bootCount == 0) {
-        // ── Primo boot: fase di calibrazione ──────────────────────────────
+        // ── First boot: calibration learning phase ────────────────────────
         sendMsg("LOG", "[ACTION] First boot → calibration learning phase");
 
         bool ok = sendMsgWithACK("CMD", "START_LEARN");
-        if (!ok) {
-            sendMsg("LOG", "[WARN] Observer non ha confermato START_LEARN");
-        }
+        if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_LEARN");
         delay(300);
 
-        // Pompa ON per 10 s con telemetria live ogni 500 ms
+        // Pump ON for 10 s, send live telemetry every 500 ms
         digitalWrite(PUMP_PIN, HIGH);
-        unsigned long t0 = millis();
+        unsigned long t0          = millis();
         unsigned long last_update = millis();
 
         while (millis() - t0 < 10000 && !emergency_stop) {
             if (millis() - last_update >= 500) {
                 last_update = millis();
-                float live_turb = readTurbidityNTU(water_temp);
-                float live_temp = tempSensor.getTempCByIndex(0);
                 tempSensor.requestTemperatures();
+                float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
+                float live_turb = readTurbidityRandom();
                 sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
                         "," + String(live_temp, 1));
             }
@@ -276,26 +309,25 @@ void setup() {
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
     } else if (turbidity_ntu > TURB_THRESHOLD_NTU) {
-        // ── Acqua torbida: pompa ON con monitoraggio ───────────────────────
+        // ── Dirty water: pump ON with anomaly monitoring ──────────────────
         sendMsg("LOG", "[ACTION] Turbidity=" + String(turbidity_ntu, 1) +
-                " NTU > soglia → pump ON (10 s)");
+                " NTU > threshold → pump ON (10 s)");
 
         bool ok = sendMsgWithACK("CMD", "START_MONITOR");
-        if (!ok) {
-            sendMsg("LOG", "[WARN] Observer non ha confermato START_MONITOR");
-        }
+        if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_MONITOR");
         delay(300);
 
         digitalWrite(PUMP_PIN, HIGH);
-        unsigned long t0 = millis();
+        unsigned long t0          = millis();
         unsigned long last_update = millis();
 
         while (millis() - t0 < 10000 && !emergency_stop) {
             if (millis() - last_update >= 500) {
                 last_update = millis();
-                float live_turb = readTurbidityNTU(water_temp);
-                float live_temp = tempSensor.getTempCByIndex(0);
                 tempSensor.requestTemperatures();
+                // Guard -127: use last valid temperature if probe glitches
+                float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
+                float live_turb = readTurbidityRandom();
                 sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
                         "," + String(live_temp, 1));
             }
@@ -306,17 +338,45 @@ void setup() {
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
     } else {
-        // ── Acqua pulita: dispensa cibo con servo ──────────────────────────
-        sendMsg("LOG", "[ACTION] Water clean (" + String(turbidity_ntu, 1) +
-                " NTU) → dispensing food");
-        sendMsg("LOG", "[SERVO] Open 90°");
-        servoMove(1500, 35);
-        delay(1000);
+        // ── Clean water: dispense food with servo, then run pump briefly ──
+        sendMsg("LOG", "[ACTION] Water clean (" + String(turbidity_ntu, 1) + " NTU) → dispensing food + short pump cycle");
+
+        // Servo: one full rotation (open → close)
+        sendMsg("LOG", "[SERVO] Open 90° — dispensing");
+        servoMove(1500, 35);   // ~630 ms at 18 ms/pulse × 35 pulses
+        delay(500);
         sendMsg("LOG", "[SERVO] Close 0°");
         servoMove(1000, 35);
+        delay(500);
+
+        // Pump ON for 5 s (short circulation after feeding)
+        sendMsg("LOG", "[PUMP] Short pump cycle (5 s) after feeding");
+
+        bool ok = sendMsgWithACK("CMD", "START_MONITOR");
+        if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_MONITOR");
+        delay(5);
+
+        digitalWrite(PUMP_PIN, HIGH);
+        unsigned long t0          = millis();
+        unsigned long last_update = millis();
+
+        while (millis() - t0 < 5000 && !emergency_stop) {
+            if (millis() - last_update >= 500) {
+                last_update = millis();
+                tempSensor.requestTemperatures();
+                float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
+                float live_turb = readTurbidityRandom();
+                sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
+                        "," + String(live_temp, 1));
+            }
+            delay(10);
+        }
+        digitalWrite(PUMP_PIN, LOW);
+        sendMsgWithACK("CMD", "STOP_MEASURE");
+        sendMsg("LOG", "[PUMP] Short cycle done");
     }
 
-    // ── Fine ciclo: deep sleep ─────────────────────────────────────────────
+    // ── End of cycle: deep sleep ───────────────────────────────────────────
     goToSleep();
 }
 

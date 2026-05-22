@@ -1,5 +1,6 @@
 # FLOAT
-
+uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60};
+uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
 **Framework for Local Observation of Aquatic Tanks**
 
 FLOAT is an Edge IoT system designed to monitor and control aquatic tanks using low-power embedded devices.
