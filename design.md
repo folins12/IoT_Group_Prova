@@ -112,18 +112,18 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
     │  mode == LEARNING?    │──YES──► collect current samples
     └───────────┬───────────┘
                 │ NO
-    ┌───────────▼───────────────────────────────────────────────┐
-    │  mode == MONITORING  AND  is_calibrated?                  │
-    │                                                           │
-    │  grace_period > 0 → skip (motor inrush)                   │
-    │  grace_period == 0 → check:                               │
-    │    STALL   : EWMA > μ + 3σ                                │
-    │    DRY_RUN : EWMA < 30 % μ                                │
-    │    VOLT    : V < 90 % V_baseline                          │
-    │    TEMP    : T < 18 °C or T > 30 °C                       │
-    │                                                           │
-    │  anomaly confirmed (3 consecutive) → HALT burst + lock    │
-    └───────────┬───────────────────────────────────────────────┘
+    ┌───────────▼───────────────────────────────────────────────┐                  ____________________________________
+    │  mode == MONITORING  AND  is_calibrated?                  │                 | mode == MONITORNG AND is_calibrated|
+    │                                                           │                 |                                    |
+    │  grace_period > 0 → skip (motor inrush)                   │                 |  TEMP: T < 18 °C or T > 30 °C ?    |
+    │  grace_period == 0 → check:                               │_________________|                                    |
+    │    STALL   : EWMA > μ + 3σ                                │                 |                                    |
+    │    DRY_RUN : EWMA < 30 % μ                                │                 | anomaly confirmed ( x consecutive) |
+    │    VOLT    : V < 90 % V_baseline                          │                 |                                    |
+    │                                                           │                 |   ->    buzzer                     |
+    │                                                           │                 |                                    |
+    │  anomaly confirmed (3 consecutive) → HALT burst + lock    │                 |___________________________________ |
+    └───────────┬───────────────────────────────────────────────┘                  
                 │ NO
                 ▼
         IDLE (delay 2000 ms)
