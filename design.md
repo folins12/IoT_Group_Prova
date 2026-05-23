@@ -1,9 +1,6 @@
-# FLOAT — Design Document (Final)
+# FLOAT - Design Document (Final)
 
-> **Previous versions:** [v1 – Mid-term design](https://github.com/your-repo/blob/midterm/docs/design_v1.md)
-> *(replace the link above with your actual GitHub history link)*
 
----
 
 ## 1. Hardware Components
 
@@ -14,20 +11,18 @@
 | INA219 current/voltage sensor (I2C) | Observer | Motor current and bus voltage measurement |
 | DS18B20 waterproof temperature probe | Target | Real-time water temperature |
 | Turbidity sensor (analog, 0–5 V) | Target (via ADC) | Water clarity in NTU |
-| Submersible water pump (5–12 V DC) | Target | Water filtration and circulation |
+| Submersible water pump (3-5 V DC) | Target | Water filtration and circulation |
 | SG90 micro servo | Target | Food dispenser gate actuation |
-| Passive buzzer | Observer | Local audible alarm on anomaly |
+| Active buzzer | Observer | Local audible alarm on anomaly |
 
-> **Note on turbidity sensor:** The analog turbidity sensor was tested on the ESP32 ADC (pin 1) but produced unreliable readings due to RF interference from the ESP-NOW radio. As a workaround, the current firmware uses a randomised NTU value for demo purposes (`readTurbidityRandom()`). The physical sensor reading function (`readTurbidityNTU()`) is fully implemented and documented; the switch between the two modes requires changing a single function call. A future hardware revision would route the sensor through an Arduino that forwards values to the ESP32 via UART or I2C, eliminating the RF interference issue.
 
----
 
 ## 2. Network Architecture
 
-The system uses **ESP-NOW** (IEEE 802.11 connectionless protocol, no router needed) on channel 13 with maximum TX power (19.5 dBm). This choice eliminates battery brownouts caused by DHCP association and dramatically reduces communication latency compared to standard WiFi or MQTT.
+The system uses **ESP-NOW** (IEEE 802.11 connectionless protocol, no router needed) on channel 13. This choice eliminates battery brownouts caused by DHCP association and dramatically reduces communication latency compared to standard WiFi or MQTT.
 
 ```
-Target (ESP32)  ──ESP-NOW ch13──►  Observer (ESP32)  ──WiFi AP──►  Browser
+   Target (ESP32)  ──ESP-NOW ch13──►  Observer (ESP32)    ──WiFi AP──►  Browser
   • Sensor data                      • Anomaly detection              • Dashboard
   • Status commands                  • Emergency HALT                 • http://192.168.4.1
   • ACK replies                      • Dashboard serving
@@ -35,7 +30,7 @@ Target (ESP32)  ──ESP-NOW ch13──►  Observer (ESP32)  ──WiFi AP─�
 
 The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the dashboard, STA mode is required for ESP-NOW. Both interfaces share channel 13.
 
----
+
 
 ## 3. Communication Protocol
 
@@ -46,7 +41,6 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
 | Log | `LOG:<text>` | Human-readable status line, printed on Observer Serial |
 | Sensor data | `DATA:SENSOR:<ntu>,<temp_c>` | Turbidity (NTU) + temperature (°C) |
 | Command (reliable) | `CMD:<name>\|ID:<n>` | Critical command; Observer replies `ACK:<n>` |
-| Periodic stall warn | `CMD:PERIODIC_STALL` | Fired when anomaly_count ≥ 3 across boots |
 
 ### 3.2 Observer → Target (ESP-NOW)
 
@@ -54,7 +48,6 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
 |---|---|
 | `HALT` | Emergency pump stop; sent ×10 in burst to overcome RF interference |
 | `ACK:<n>` | Handshake reply to a `CMD:\|ID:<n>` message |
-| `CAL:<μ>,<σ>,<th_stall>,<th_dry>` | Calibration results forwarded to Target for logging |
 
 ### 3.3 Dashboard → Observer (HTTP POST)
 
@@ -67,7 +60,7 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
 | `POST /api/auto` | Toggle auto mode |
 | `GET /api/events` | Server-Sent Events stream (JSON, every 400 ms) |
 
----
+
 
 ## 4. Software Architecture
 
@@ -78,7 +71,7 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
              │
              ▼
     ┌─────────────────┐
-    │  system_halted? │──YES──► deep sleep (20 s, repeat)
+    │  system_halted? │──YES──► deep sleep (20 s, reset)
     └────────┬────────┘
              │ NO
              ▼
@@ -87,11 +80,11 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
     init ESP-NOW
              │
     ┌────────▼────────┐
-    │  bootCount==0?  │──YES──► START_LEARN + pump 10 s → STOP_MEASURE
+    │  bootCount==0?  │──YES──► START_LEARN → STOP_MEASURE
     └────────┬────────┘
              │ NO
     ┌────────▼─────────────┐
-    │  turbidity > 50 NTU? │──YES──► START_MONITOR + pump 10 s → STOP_MEASURE
+    │  turbidity < 50 NTU? │──YES──► START_MONITOR + pump 10 s → STOP_MEASURE
     └────────┬─────────────┘
              │ NO
              ▼
@@ -131,13 +124,12 @@ The Observer runs in **WIFI_AP_STA** mode simultaneously: AP mode serves the das
     │                                                           │
     │  anomaly confirmed (3 consecutive) → HALT burst + lock    │
     └───────────┬───────────────────────────────────────────────┘
-                │ NO (IDLE)
+                │ NO
                 ▼
-    print IDLE line (no temperature, to reduce noise)
-    delay 2000 ms
+        IDLE (delay 2000 ms)
 ```
 
----
+
 
 ## 5. Anomaly Detection Algorithm
 
@@ -177,7 +169,7 @@ Priority order (when multiple flags active simultaneously): STALL > DRY_RUN > VO
 
 ### 5.3 Temperature in the Learning Phase (planned extension)
 
-The current implementation uses static temperature thresholds [18 °C, 30 °C]. A natural improvement — identified as the next development step — is to **record the water temperature during the calibration learning phase** and derive an adaptive baseline:
+The current implementation uses static temperature thresholds [18 °C, 30 °C]. A natural improvement - identified as the next development step - is to **record the water temperature during the calibration learning phase** and derive an adaptive baseline:
 
 ```
 T_baseline = mean(T_during_learning)
@@ -187,26 +179,18 @@ T_max = T_baseline + ΔT_high   (e.g. ΔT_high = 4 °C)
 
 This would make the temperature anomaly detection **personalised to each aquarium**: a tropical tank calibrated at 26 °C would have different limits than a cold-water tank calibrated at 20 °C, without requiring any manual configuration. The architecture is fully in place to support this (temperature is already transmitted during the learning window); it requires only adding an accumulator in the Observer's `LEARNING` branch.
 
----
 
-## 6. Sensor Fusion: How Turbidity and Temperature Work Together
 
-The two sensors on the Target are not independent; they interact in multiple ways:
+## 6. How Turbidity and Temperature Work Together
 
-**6.1 Viscosity compensation:**
+The two sensors on the Target are not independent; they interact in the viscosity compensation.
 Water turbidity sensors measure optical backscattering. At higher temperatures, water viscosity decreases, causing suspended particles to settle faster. The same physical quantity of suspended material produces a lower ADC reading at 30 °C than at 20 °C. The Target applies a linear correction before transmitting:
 ```
 NTU_corrected = NTU_raw / (1 + 0.005 × (T − 25))
 ```
 Without this correction, a warming tank would appear to "self-clean" in sensor readings, masking actual water quality issues.
 
-**6.2 Anomaly context:**
-A MOTOR_STALL detected at 28 °C (high temperature, lower viscosity) is more significant than the same electrical signature at 20 °C, because the pump should draw *less* current at lower viscosity. The system logs temperature alongside all anomaly events, enabling post-hoc analysis of failure patterns.
 
-**6.3 Cause disambiguation:**
-Turbidity alone cannot distinguish algae bloom from debris contamination. Algae blooms are typically accompanied by a temperature rise (metabolic heat), while debris contamination is temperature-neutral. By correlating turbidity and temperature trends, a future version could provide a more specific diagnosis.
-
----
 
 ## 7. Dashboard and IoT Security
 
@@ -232,7 +216,7 @@ No router, Internet connection, or mobile data is required.
 
 HTTP (not HTTPS) is used because the ESP32 `WebServer` library does not support TLS without self-signed certificate management, which would significantly complicate deployment. Since the AP is local-only (no Internet), the attack surface is limited to devices physically present on the local network. HTTPS with a self-signed certificate is identified as the primary future security improvement.
 
----
+
 
 ## 8. Deep Sleep and Energy Budget
 
@@ -240,17 +224,17 @@ The Target node uses ESP32 deep sleep between measurement cycles.
 
 | Parameter | Value |
 |---|---|
-| Active time per cycle | ~2 s (boot + sense + transmit) |
+| Active time per cycle | ~10 s (boot + sense + transmit) |
 | Sleep time per cycle | 20 s |
 | Active duty cycle | 2/22 = **9.1%** |
 | Sleep duty cycle | 20/22 = **90.9%** |
-| Estimated current (active) | ~160 mA (ESP32 + pump startup) |
-| Estimated current (sleep) | ~0.01 mA (deep sleep RTC only) |
+| Estimated current (active) | ~195 mA (ESP32 + pump startup) |
+| Estimated current (sleep) | ~14 mA (deep sleep RTC only) |
 | Mean current (2000 mAh battery) | ~14.6 mA → **~137 h ≈ 5.7 days** |
 
 The Observer node runs continuously (no deep sleep) since it must serve the dashboard and receive ESP-NOW messages at any time.
 
----
+
 
 ## 9. Evolution from Mid-term Version
 
@@ -262,6 +246,6 @@ The Observer node runs continuously (no deep sleep) since it must serve the dash
 | Dashboard | Not present | Real-time HTML dashboard on ESP32 AP, SSE push at 400 ms |
 | ESP-NOW channel | Default (0) | Fixed channel 13, max TX power |
 | Deep sleep | 10 s cycle | 20 s cycle (91% sleep) |
-| Turbidity | Random % | Real ADC function implemented; random demo mode pending hardware fix |
+| Turbidity | Simulated | Real ADC function implemented; random demo mode pending hardware fix |
 | Anomaly burst | Single HALT packet | ×10 burst to overcome RF interference |
 | Grace period | Not present | 4 samples (~1.6 s) after pump start |
