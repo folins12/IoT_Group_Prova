@@ -4,18 +4,23 @@
  * Measures turbidity + temperature, drives pump and food servo.
  * Communicates via ESP-NOW (channel 13) with the Observer node.
  * Anomalies detected by Observer: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP,
- *   TEMP_OUT_OF_RANGE, PERIODIC_STALL, COMMUNICATION_LOSS.
+ *   TEMP_TOO_HIGH, TEMP_TOO_LOW, PERIODIC_STALL, COMMUNICATION_LOSS.
  *
  * Changes vs previous version:
  *   - Temperature guard in monitoring loop: -127 °C (DS18B20 disconnect)
  *     is discarded and replaced with last valid reading
  *   - Turbidity value is randomised on every boot (demo / test mode)
  *   - Clean water action: servo dispenses food AND pump runs for 5 s
+ *     with anomaly monitoring (START_MONITOR / STOP_MEASURE)
  *   - ACK / retry with exponential backoff on critical commands
  *   - Turbidity read BEFORE WiFi init (stable ADC, no RF interference)
  *   - RTC counters for recurring anomalies and missed ACKs
  *   - Deep sleep raised to 20 s → duty cycle ~9 % (91 % sleep)
- *   - All comments translated to English
+ *   - During the learning phase, DATA:SENSOR messages carry temperature
+ *     every 500 ms so the Observer builds ~20 temperature samples over the
+ *     10 s learning window. The Observer uses its own counter (temp_sample_idx)
+ *     independent from the current sample counter, avoiding index-alignment
+ *     bugs that previously caused 0.0f padding and a wrong baseline mean.
  */
 
 #include <Arduino.h>
@@ -76,6 +81,21 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     } else if (s.startsWith("ACK:")) {
         acked_id     = (uint32_t)s.substring(4).toInt();
         ack_received = true;
+    } else if (s.startsWith("CAL:")) {
+        // Format: CAL:mean,std,th_stall,th_dry,th_temp_high,th_temp_low
+        // Log the calibration result for diagnostics; thresholds are enforced by Observer.
+        String p  = s.substring(4);
+        int c1 = p.indexOf(','), c2 = p.indexOf(',', c1+1);
+        int c3 = p.indexOf(',', c2+1), c4 = p.indexOf(',', c3+1);
+        int c5 = p.indexOf(',', c4+1);
+        if (c5 != -1) {
+            Serial.printf("[TGT] Calibration received — stall:%.1f mA  dry:%.1f mA"
+                          "  T↑:%.1f °C  T↓:%.1f °C\n",
+                          p.substring(c2+1, c3).toFloat(),
+                          p.substring(c3+1, c4).toFloat(),
+                          p.substring(c4+1, c5).toFloat(),
+                          p.substring(c5+1).toFloat());
+        }
     }
 }
 
@@ -288,13 +308,14 @@ void setup() {
         if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_LEARN");
         delay(300);
 
-        // Pump ON for 10 s, send live telemetry every 500 ms
+        // Pump ON for 10 s, send live telemetry every 300 ms
+        // (matches Observer loop rate so sample counts stay in sync)
         digitalWrite(PUMP_PIN, HIGH);
         unsigned long t0          = millis();
         unsigned long last_update = millis();
 
         while (millis() - t0 < 10000 && !emergency_stop) {
-            if (millis() - last_update >= 500) {
+            if (millis() - last_update >= 300) {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
@@ -322,7 +343,7 @@ void setup() {
         unsigned long last_update = millis();
 
         while (millis() - t0 < 10000 && !emergency_stop) {
-            if (millis() - last_update >= 500) {
+            if (millis() - last_update >= 300) {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 // Guard -127: use last valid temperature if probe glitches
@@ -361,7 +382,7 @@ void setup() {
         unsigned long last_update = millis();
 
         while (millis() - t0 < 5000 && !emergency_stop) {
-            if (millis() - last_update >= 500) {
+            if (millis() - last_update >= 300) {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
