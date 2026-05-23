@@ -1,4 +1,4 @@
-# FLOAT — Final Evaluation Summary
+# FLOAT - Final Evaluation Summary
 
 This document summarizes the final evaluation of the FLOAT system, detailing the 4 core requirements, their measurement outcomes, and the unmet goals. 
 
@@ -13,7 +13,7 @@ This document summarizes the final evaluation of the FLOAT system, detailing the
 
 ## 2. Core Requirements Analysis
 
-### R1 — Motor Anomaly Cutoff (< 2000 ms)
+### R1 - Motor Anomaly Cutoff (< 2000 ms)
 **Goal:** Stop the pump within 2 seconds of a stall or dry-run to prevent irreversible hardware damage.
 
 **Implementation:**
@@ -24,17 +24,17 @@ This document summarizes the final evaluation of the FLOAT system, detailing the
 
 **Result:** ✅ REQUIREMENT MET. Reaction time measured from serial logs is exactly ~1250 ms.
 
-### R2 — Temperature Out-of-Range Notification (< 10 s)
+### R2 - Temperature Out-of-Range Notification (< 10 s)
 **Goal:** Notify the user if water temperature remains outside [18 °C, 30 °C] continuously for 10 seconds.
 
 **Implementation:**
-* **Advisory Action:** The pump is *not* stopped (stopping circulation harms the fish). The Observer triggers a buzzer and pushes an SSE alert to the Dashboard.
+* **Advisory Action:** The pump is stopped. The Observer triggers a buzzer and pushes an SSE alert to the Dashboard.
 * **Detection Latency:** Requires 25 consecutive out-of-range samples (25 × 400 ms = 10 s) to confirm the excursion and ignore transient noise.
-* **Glitch Suppression:** Known DS18B20 hardware CRC errors (returning -127 °C) are actively intercepted and discarded by the firmware.
+* **Glitch Suppression:** Known DS18B20 hardware CRC errors are actively intercepted and discarded by the firmware.
 
 **Result:** ✅ REQUIREMENT MET. Glitch suppression proved effective during hardware tests.
 
-### R3 — False Positive Rate (< 0.3 %)
+### R3 - False Positive Rate (< 0.3 %)
 **Goal:** Prevent unnecessary HALT events during normal pump operation.
 
 **Implementation:**
@@ -44,7 +44,7 @@ This document summarizes the final evaluation of the FLOAT system, detailing the
 
 **Result:** ✅ REQUIREMENT MET. 0.0% FPR observed across all final hardware test runs.
 
-### R4 — Connectionless Edge-to-Edge Communication
+### R4 - Connectionless Edge-to-Edge Communication
 **Goal:** The safety-critical loop (Target ↔ Observer) must function without any external WiFi infrastructure.
 
 **Implementation:**
