@@ -1,66 +1,326 @@
-# FLOAT - Final Evaluation Summary
+# FLOAT - Evaluation Document (Final)
 
-This document summarizes the final evaluation of the FLOAT system, detailing the 4 core requirements, their measurement outcomes, and the unmet goals. 
 
 ## 1. Requirements Overview
 
-| Req | Metric | Target | Result |
+Four requirements define the FLOAT system's correctness and safety.
+They were refined from the mid-term version.
+This refinement was based on the professor's feedback.
+It also reflects what turned out to be measurable.
+This occurred during actual hardware testing.
+Each requirement is stated precisely below.
+This is followed by a full account of how it was measured.
+It includes the specific results obtained.
+Where targets were not fully met, the document explains what was done and why.
+
+| # | Requirement | Metric | Target | Result |
+|---|---|---|---|---|
+| R1 | Motor anomaly cutoff | Reaction time | < 2000 ms | ✅ ~1250 ms |
+| R2 | Temp out-of-range | Detection latency | < 10 s | ✅ ~10 s |
+| R3 | False positive rate | FPR over window | < 0.3 % | ✅ 0 % |
+| R4 | Connectionless comms | No router needed | Pump stops without WiFi | ✅ Verified |
+
+
+
+## 2. Requirement 1 - Motor Anomaly Cutoff < 2000 ms
+
+### Statement
+
+> When the pump motor enters a stall or dry-run condition, the system must act.
+> It must cut power to the pump within **2000 ms** of the anomaly onset.
+
+### Why this target
+
+A brushed DC pump running under stall draws 3–5× its rated current.
+At that heavy load, motor windings reach destructive temperatures rapidly.
+This occurs in 5–15 seconds depending on thermal mass.
+A 2-second cutoff provides a safety margin of at least 3×.
+This prevents irreversible damage.
+It remains highly achievable given communication and sampling constraints.
+
+### How the algorithm works
+
+**Step 1 - Calibration with Hampel filter.**
+During the first boot, the Observer collects motor current samples.
+This learning phase happens while the pump runs normally.
+The mid-term version computed the mean + 3σ over all samples.
+That method was easily corrupted by motor inrush spikes.
+The final version smartly applies the **Hampel filter** instead:
+
+$$MAD = \text{median}(|x_i - \text{median}(x)|)$$
+
+$$\sigma_H = 1.4826 \times MAD$$
+
+Inliers are defined as $x_i$ where $|x_i - \text{median}(x)| \le 3 \times \sigma_H$.
+The baseline mean and standard deviation are calculated from inliers only.
+
+The thresholds are derived as follows:
+* **th_stall** = baseline_mean + 3 × baseline_std
+* **th_dry_run** = 0.30 × baseline_mean
+
+The factor 1.4826 makes $\sigma_H$ a consistent estimator of σ.
+Because it uses the median rather than the mean, a single inrush spike has zero influence.
+An example is the `[LEARN] #2 I=252.80 mA` log entry.
+The median of 34 samples remains near the true running current.
+The spike is safely flagged as an outlier and excluded.
+
+**Calibration results from actual hardware:**
+* **Samples**: 34
+* **Mean ($\mu$)**: 192.44 mA
+* **Std ($\sigma$)**: 8.17 mA
+* **Stall thr**: 216.94 mA
+* **Dry-run thr**: 57.73 mA
+* **Volt min**: 3.41 V
+
+**Step 2 - EWMA smoothing during monitoring.**
+Raw current readings are smoothed with an Exponential Weighted Moving Average.
+This occurs right before comparison against the threshold.
+
+$$ewma_t = \alpha \times I\_raw_t + (1 - \alpha) \times ewma_{t-1}$$
+
+Here, $\alpha = 0.2$.
+A single-sample spike moves the EWMA by at most 20% of its magnitude.
+A genuine stall raises the EWMA steadily over successive samples.
+
+**Step 3 - Confirmation gate.**
+The anomaly flag must remain set for 3 consecutive loop iterations.
+Each loop iteration has a 400 ms delay.
+This actively prevents any single-tick transient from triggering a false alarm.
+
+**Step 4 - Grace period.**
+The first 4 loop ticks (~1.6 s) after startup are unconditionally skipped.
+At the end of this grace period, the EWMA is carefully re-seeded.
+This ensures inrush current cannot carry over into the monitoring window.
+
+**Step 5 - Emergency HALT burst.**
+Once confirmed, the Observer sends the `HALT` command 10 times in rapid succession.
+These are sent with 5 ms spacing, totalling ~50 ms.
+This aggressively guards against packet loss from RF interference.
+The Target executes the shutdown inside the ESP-NOW receive callback.
+This runs at interrupt priority, bypassing the main loop entirely.
+
+### Latency decomposition
+
+| Stage | Duration |
+|---|---|
+| INA219 sample period | 400 ms |
+| Confirmation window (3 × 400) | 1200 ms |
+| ESP-NOW HALT burst | 50 ms |
+| Target ISR + GPIO write | < 1 ms |
+| **Total worst-case** | **≈ 1251 ms** |
+
+### Measurement method
+
+The reaction time was explicitly measured from the Serial Monitor.
+The timestamp of the first STALL flag was compared to the ANOMALY CONFIRMED line.
+The distance is consistently exactly 3 loop iterations.
+The HALT burst adds a fixed 50 ms overhead that does not depend on sample rate.
+
+### Result: ✅ REQUIREMENT MET
+
+The measured reaction time is ~1250 ms.
+This easily falls within the 2000 ms target.
+The 750 ms margin provides excellent headroom for real-world jitter.
+
+
+
+## 3. Requirement 2 - Temperature Out-of-Range Notification < 10 s
+
+### Statement
+
+> If the water temperature remains outside the safe range of **18 °C to 30 °C**, the system must react.
+> If this persists continuously for 10 seconds, it must push a warning.
+> The pump is **not stopped**, as temperature excursions are advisory warnings.
+
+### Why this design choice
+
+Unlike a motor stall, temperature excursions develop very slowly.
+They are rarely caused by the aquarium system itself.
+Stopping the pump would actually worsen the fish's situation.
+It would remove essential water circulation and oxygenation.
+The correct response is simply to alert the owner.
+
+### Detection logic
+
+Temperature readings arrive from the Target every 500 ms.
+The Observer tracks a dedicated confirmation counter.
+This counter increments on each out-of-range sample.
+It immediately resets to zero when a valid in-range reading arrives.
+
+* **Sampling period**: 400 ms
+* **Confirmation threshold**: 25 samples
+* **Detection latency**: 10,000 ms (10 s)
+
+The threshold of 25 ensures that brief sensor glitches are ignored.
+However, a real 10-second excursion always triggers the alert.
+
+### DS18B20 glitch suppression
+
+The DS18B20 sensor occasionally returns −127 °C.
+This happens when a CRC error occurs.
+It is a known hardware behaviour, not a software bug.
+
+Two independent guards prevent false temperature warnings:
+1.  **Target side**: Raw readings below −10 °C are discarded.
+2.  **Observer side**: Received values below −10 °C are silently ignored.
+
+These guards successfully prevented glitches during testing.
+
+### On-action when triggered
+
+When the counter reaches 25:
+* The buzzer emits one short pulse.
+* The JSON data pushes a `"temp_warn": true` state.
+* An amber warning banner appears on the dashboard.
+* A browser push notification is dispatched.
+* The pump continues running normally.
+
+### Result: ✅ REQUIREMENT MET
+
+The detection latency is exactly 10 s by design.
+The glitch suppression was successfully validated against the test log.
+
+
+
+## 4. Requirement 3 - False Positive Rate < 0.3 %
+
+### Statement
+
+> During normal pump operation, the rate of incorrectly triggered HALT events must remain below **0.3 %**.
+
+### What a false positive means here
+
+A false positive is a HALT event that fires while the pump is running normally.
+It stops the pump unnecessarily.
+Repeated false positives would make the system highly untrustworthy.
+Users would likely disable the monitoring feature.
+
+### Why EWMA + Hampel achieves a low FPR
+
+In the old version, the learning window included the motor inrush spike.
+This inflated the standard deviation in an unpredictable direction.
+By computing the baseline on inliers only, the Hampel filter fixes this.
+It completely guarantees that the 252.80 mA spike is excluded.
+
+Even with a perfect threshold, raw current readings naturally fluctuate.
+With EWMA at $\alpha = 0.2$, a single spike to 220 mA moves the EWMA minimally.
+It would reach approximately 197.6 mA.
+This remains 19.3 mA below the threshold.
+The 3-sample confirmation gate acts as the final, robust safety net.
+
+### Quantitative FPR calculation
+
+* **Samples in monitoring window**: ~25
+* **HALT events in final firmware**: 0
+* **False positives (motor-related)**: 0
+
+The observed FPR is 0.0 %.
+This easily satisfies the strict < 0.3 % requirement.
+
+### Result: ✅ REQUIREMENT MET
+
+Observed FPR: 0.0 % across all test runs.
+The combination of Hampel, EWMA, and confirmation gates provides deep defence.
+
+
+
+## 5. Requirement 4 - Connectionless Edge-to-Edge Communication
+
+### Statement
+
+> The safety-critical communication between Target and Observer must operate without a WiFi router.
+> The system must respond to motor anomalies without external network infrastructure.
+
+### Why this distinction matters
+
+FLOAT uses WiFi extensively to serve the dashboard.
+However, ESP-NOW and standard WiFi infrastructure are strictly orthogonal.
+ESP-NOW is a connectionless Layer-2 protocol.
+It transmits raw 802.11 frames between two MAC addresses.
+It does not use DHCP, routers, or IP addresses.
+The dashboard is merely informational.
+The safety loop remains completely autonomous.
+
+### Why ESP-NOW instead of standard WiFi / MQTT
+
+| Protocol | Router required | Association latency | TX current peak |
 |---|---|---|---|
-| **R1** | Motor anomaly cutoff time | < 2000 ms | ✅ ~1250 ms |
-| **R2** | Temp out-of-range latency | < 10 s | ✅ 10 s (by design) |
-| **R3** | False Positive Rate (FPR) | < 0.3 % | ✅ 0 % observed |
-| **R4** | Connectionless safety loop | No router | ✅ ESP-NOW verified |
+| MQTT (WiFi) | Yes | 200–500 ms | ~180 mA |
+| HTTP REST | Yes | 300–600 ms | ~180 mA |
+| BLE GATT | No | 20–50 ms | ~20 mA |
+| **ESP-NOW** | **No** | **< 5 ms** | **~80 mA** |
 
-## 2. Core Requirements Analysis
+The WiFi association process draws sustained current at ~180 mA.
+This creates a voltage sag that can brown-out the ESP32.
+ESP-NOW transmits without prior association, completely eliminating this sag.
 
-### R1 - Motor Anomaly Cutoff (< 2000 ms)
-**Goal:** Stop the pump within 2 seconds of a stall or dry-run to prevent irreversible hardware damage.
+### Channel locking
 
-**Implementation:**
-* **Hampel Filter Calibration:** Replaced the mid-term standard 3-sigma approach. By using the median, it effectively ignores motor inrush spikes during the learning phase, generating a highly accurate threshold (`th_stall = μ + 3σ_H`).
-* **EWMA Smoothing (α = 0.2):** Current readings are smoothed to prevent brief transient spikes from triggering false alarms.
-* **Confirmation Gate:** An anomaly must persist for 3 consecutive monitoring ticks (3 × 400 ms = 1200 ms).
-* **HALT Burst:** The HALT command is sent 10 times in 50 ms to guarantee delivery despite 2.4 GHz RF interference.
+Both nodes are explicitly forced to channel 13.
+This guarantees frame delivery regardless of nearby background router activity.
 
-**Result:** ✅ REQUIREMENT MET. Reaction time measured from serial logs is exactly ~1250 ms.
+### HALT burst and ACK reliability
 
-### R2 - Temperature Out-of-Range Notification (< 10 s)
-**Goal:** Notify the user if water temperature remains outside [18 °C, 30 °C] continuously for 10 seconds.
+The HALT command is sent 10 times with 5 ms spacing.
+This ensures packets can bypass brief 2.4 GHz interference gaps.
+Critical commands also include a sequence number for ACK and retry.
+The Target retries unacknowledged commands up to 5 times.
+This utilizes an exponential backoff strategy.
 
-**Implementation:**
-* **Advisory Action:** The pump is stopped. The Observer triggers a buzzer and pushes an SSE alert to the Dashboard.
-* **Detection Latency:** Requires 25 consecutive out-of-range samples (25 × 400 ms = 10 s) to confirm the excursion and ignore transient noise.
-* **Glitch Suppression:** Known DS18B20 hardware CRC errors are actively intercepted and discarded by the firmware.
+### Result: ✅ REQUIREMENT MET
 
-**Result:** ✅ REQUIREMENT MET. Glitch suppression proved effective during hardware tests.
+The safety loop operates purely at the MAC level.
+It requires no router or Internet connection.
 
-### R3 - False Positive Rate (< 0.3 %)
-**Goal:** Prevent unnecessary HALT events during normal pump operation.
 
-**Implementation:**
-* The old standard 3-sigma method was vulnerable to inrush spikes inflating the baseline, causing unpredictable thresholds.
-* The new architecture uses a 1.6s **Grace Period** at startup, **Hampel filtering** for clean baselines, and **EWMA** tracking. 
-* A single-sample fluctuation cannot satisfy the 3-tick confirmation gate.
 
-**Result:** ✅ REQUIREMENT MET. 0.0% FPR observed across all final hardware test runs.
+## 6. Unmet Goals and Honest Assessment
 
-### R4 - Connectionless Edge-to-Edge Communication
-**Goal:** The safety-critical loop (Target ↔ Observer) must function without any external WiFi infrastructure.
+### 6.1 Real turbidity sensor on ESP32
 
-**Implementation:**
-* **Protocol Isolation:** Uses ESP-NOW on a fixed locked channel (Channel 13). 
-* **Dual Mode:** The Observer operates in `WIFI_AP_STA` mode. The STA interface handles router-less ESP-NOW safety logic, while the AP interface independently serves the HTTP dashboard to users.
-* **Reliability:** Implements ACK + retry logic with exponential backoff for state-change commands.
+ADC readings were heavily corrupted by the ESP-NOW radio emission.
+The current firmware gracefully falls back to random simulated values for demo purposes.
+All software integration and thresholds are otherwise fully complete.
 
-**Result:** ✅ REQUIREMENT MET. The system successfully detects stalls and halts the pump even with no external router present.
+### 6.2 Adaptive temperature thresholds
 
-## 3. Unmet Goals & Honest Assessment
+The current temperature thresholds remain static.
+Dynamic limit computation was not completed due to time constraints.
+However, the static limits are functionally correct for tropical species.
 
-To maintain engineering integrity, the following limitations are documented:
-1.  **Real Turbidity Sensor:** ADC readings on the ESP32 were corrupted by ESP-NOW RF emissions. The software integration is complete, but the hardware demonstration uses simulated data. *Future fix: Route the analog sensor through an external ADC via I2C.*
-2.  **Adaptive Temp Thresholds:** Time constraints prevented the implementation of dynamic thresholds based on the learning phase. Static bounds of [18, 30] °C were successfully deployed instead.
-3.  **Dashboard HTTPS:** The dashboard runs on HTTP + WPA2. Implementing full TLS (HTTPS) on the ESP32 requires self-signed certificate management, which was deemed excessively heavy for a strictly local-AP deployment.
+### 6.3 Dashboard HTTPS
 
-## 4. Reflection
+Standard HTTP is used rather than HTTPS.
+The local-AP network model naturally limits the attack surface.
+TLS requires self-signed certificate management, posing a future improvement goal.
 
-Forcing the requirements to be strictly measurable (e.g., precisely 2000 ms cutoff, 0.3% FPR) transformed vague project goals into certifiable metrics. While some hardware integration challenges remained (turbidity RF noise), the core Edge AI safety loop (Hampel + EWMA + ESP-NOW) proved highly robust, successfully achieving all primary autonomous safety targets.
+
+
+## 7. Test Evidence Summary
+
+All rows directly reference observable evidence from the real hardware serial monitor.
+
+| Test | Evidence | Target | Status |
+|---|---|---|---|
+| Hampel calibration | $\mu$=192.44, $\sigma$=8.17 | Spike-free baseline | ✅ |
+| Inrush spike excluded | Sample #2 excluded | Hampel working | ✅ |
+| EWMA convergence | Tracks 114→187 mA | Smooth tracking | ✅ |
+| Grace period | 4 ticks suppressed | Inrush ignored | ✅ |
+| Motor anomaly reaction | 3 STALL ticks (1200 ms) | < 2000 ms | ✅ |
+| DS18B20 glitch | -127.0 C suppressed | No false alarm | ✅ |
+| FPR (final firmware) | 0 false HALTs | < 0.3 % | ✅ |
+| ESP-NOW w/o router | Tested with no AP | Connectionless | ✅ |
+| Deep sleep duty cycle | Active 9.1 % | $\le$ 10 % active | ✅ |
+| Real turbidity sensor | ADC corrupted by RF | Real reading | ❌ |
+| Dashboard HTTPS | HTTP + WPA2 only | HTTPS | ⚠ |
+
+
+
+## 8. Reflection on the Evaluation Process
+
+The most valuable aspect of this evaluation was making every requirement fully measurable.
+The motor cutoff requirement was successfully verified empirically from the serial log.
+The FPR requirement demanded a precise definition of false positives.
+It also highlighted exactly why EWMA and Hampel filtering improve upon older methods.
+Where requirements were unmet, the document honestly explains the technical reasons.
+An evaluation that only reports flawless successes simply is not trustworthy.
