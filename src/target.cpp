@@ -1,26 +1,22 @@
 /*
- * FLOAT - Target Node
- * ====================
+ * FLOAT - Target Node (v9)
+ * ========================
  * Measures turbidity + temperature, drives pump and food servo.
  * Communicates via ESP-NOW (channel 13) with the Observer node.
- * Anomalies detected by Observer: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP,
- *   TEMP_TOO_HIGH, TEMP_TOO_LOW, PERIODIC_STALL, COMMUNICATION_LOSS.
  *
- * Changes vs previous version:
- *   - Temperature guard in monitoring loop: -127 °C (DS18B20 disconnect)
- *     is discarded and replaced with last valid reading
- *   - Turbidity value is randomised on every boot (demo / test mode)
- *   - Clean water action: servo dispenses food AND pump runs for 5 s
- *     with anomaly monitoring (START_MONITOR / STOP_MEASURE)
- *   - ACK / retry with exponential backoff on critical commands
- *   - Turbidity read BEFORE WiFi init (stable ADC, no RF interference)
- *   - RTC counters for recurring anomalies and missed ACKs
- *   - Deep sleep raised to 20 s → duty cycle ~9 % (91 % sleep)
- *   - During the learning phase, DATA:SENSOR messages carry temperature
- *     every 500 ms so the Observer builds ~20 temperature samples over the
- *     10 s learning window. The Observer uses its own counter (temp_sample_idx)
- *     independent from the current sample counter, avoiding index-alignment
- *     bugs that previously caused 0.0f padding and a wrong baseline mean.
+ * Turbidity is now read from a real sensor connected to an Arduino Uno,
+ * which communicates with this ESP32 via a UART serial link (Serial1).
+ * Protocol (same as the old standalone ESP32 in main.cpp):
+ *   ESP32 → Arduino: 'T'          (request a reading)
+ *   Arduino → ESP32: "<raw_adc>\n" (raw ADC value 0-1023)
+ *   ESP32 → Arduino: "E<value>\n" (echo confirmation)
+ * The Arduino Uno sleeps via watchdog every 4 s and listens for 150 ms
+ * on wake. The ESP32 retries for up to 4.5 s to catch an Arduino wake cycle.
+ * If no response arrives the system falls back to turbidity = 0 NTU (safe: clean).
+ *
+ * Anomalies detected by Observer: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP (warning),
+ *   TEMP_TOO_HIGH (warning), TEMP_TOO_LOW (warning), PERIODIC_STALL,
+ *   COMMUNICATION_LOSS.
  */
 
 #include <Arduino.h>
@@ -35,11 +31,19 @@
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int PUMP_PIN      = 47;
 const int SERVO_PIN     = 6;
-const int TURBIDITY_PIN = 1;
-const int DS18B20_PIN   = 4;
+const int DS18B20_PIN   = 7;
 
-// ── Turbidity sensor calibration ──────────────────────────────────────────
-const int   TURB_CLEAN_ADC     = 3435;
+// ── Serial1 link to Arduino Uno (turbidity sensor) ────────────────────────
+// Arduino Uno TX → ESP32 pin 4 (RXD1)
+// Arduino Uno RX → ESP32 pin 5 (TXD1)
+const int TURB_RXD = 4;
+const int TURB_TXD = 5;
+
+// ── Turbidity sensor calibration (raw ADC from Arduino Uno → NTU) ─────────
+// These constants must match the physical sensor calibration.
+// TURB_CLEAN_ADC : ADC value in perfectly clean water (high voltage = clear)
+// TURB_DIRTY_ADC : ADC value in very dirty water (low voltage = turbid)
+const int   TURB_CLEAN_ADC     = 3435;  // ← adjust after physical calibration
 const int   TURB_DIRTY_ADC     = 1200;
 const float TURB_MAX_NTU       = 800.0f;
 const float TURB_THRESHOLD_NTU = 50.0f;
@@ -135,51 +139,76 @@ bool sendMsgWithACK(const String& type, const String& content,
     return false;
 }
 
-// ── readTurbidityNTU ───────────────────────────────────────────────────────
-// Reads ADC with WiFi OFF to avoid RF interference.
-// Applies a viscosity temperature correction.
-// Must be called BEFORE WiFi.mode(WIFI_STA) / esp_now_init().
-float readTurbidityNTU(float temp_c = 25.0f) {
-    long sum = 0;
-    for (int i = 0; i < 64; i++) {
-        sum += analogRead(TURBIDITY_PIN);
-        delay(2);
+// ── readTurbidityFromArduino ───────────────────────────────────────────────
+// Queries the Arduino Uno via Serial1 using the 'T' / 'E' handshake protocol.
+//
+// The Arduino Uno sleeps via watchdog (4 s cycles) and listens for 150 ms on
+// each wake. We retry for up to MAX_TURB_WAIT_MS (4500 ms) so we are guaranteed
+// to catch at least one Arduino wake cycle regardless of phase offset.
+//
+// Must be called BEFORE WiFi.mode() / esp_now_init() because the ADC on the
+// Arduino is read while the ESP32 radio is still off — RF interference from
+// the ESP32 could slightly affect the Uno's analog reading over the PCB traces.
+//
+// Returns the turbidity in NTU, or 0.0 (clean-water safe default) on timeout.
+//
+// Temperature correction: water viscosity drops with temperature, so particles
+// settle faster and the sensor reads lower NTU than it should. We apply a
+// ±0.5 %/°C linear correction around 25 °C reference.
+
+const unsigned long MAX_TURB_WAIT_MS = 4500; // covers one full 4-s Arduino sleep cycle
+
+float readTurbidityFromArduino(float temp_c = 25.0f) {
+    Serial1.begin(9600, SERIAL_8N1, TURB_RXD, TURB_TXD);
+    delay(100); // allow Serial1 to stabilise before sending
+
+    int   raw_adc   = 0;
+    bool  got_value = false;
+    unsigned long search_start = millis();
+
+    // Keep sending 'T' until Arduino responds or timeout expires.
+    // The Arduino discards non-'T' bytes, so repeated sends are harmless.
+    while (millis() - search_start < MAX_TURB_WAIT_MS) {
+        Serial1.print('T');
+
+        unsigned long wait_start = millis();
+        while (millis() - wait_start < 150) {
+            if (Serial1.available()) {
+                String line = Serial1.readStringUntil('\n');
+                line.trim();
+                int val = line.toInt();
+                if (line.length() > 0 && val > 0) {
+                    raw_adc   = val;
+                    got_value = true;
+                    break;
+                }
+                // Non-numeric lines (Arduino debug prints) are silently ignored.
+            }
+        }
+        if (got_value) break;
     }
-    int adc = (int)(sum / 64);
-    Serial.printf("[SENSOR] Turbidity ADC (raw): %d\n", adc);
 
-    adc = constrain(adc, TURB_DIRTY_ADC, TURB_CLEAN_ADC);
-
-    float ntu_raw = TURB_MAX_NTU *
-                    (float)(TURB_CLEAN_ADC - adc) /
-                    (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
-
-    // Temperature correction: water viscosity decreases with temperature,
-    // making particles settle faster → apparently lower NTU at high T.
-    // Linear correction ±0.5 %/°C referenced to 25 °C.
-    float temp_correction = 1.0f + 0.005f * (temp_c - 25.0f);
-    float ntu = ntu_raw / temp_correction;
-
-    return constrain(ntu, 0.0f, TURB_MAX_NTU);
-}
-
-// ── readTurbidityRandom ────────────────────────────────────────────────────
-// Returns a random NTU value for demo / testing purposes.
-// Alternates between a "dirty" range and a "clean" range each boot.
-float readTurbidityRandom() {
-    // Seed with a mix of boot count and a free-running timer
-    randomSeed(esp_random());
-    // Alternate boots: even → dirty water, odd → clean water
-    float ntu;
-    if (bootCount % 2 == 0) {
-        // Dirty: 150–2500 NTU (above threshold → pump ON)
-        ntu = random(51, 800);
-    } else {
-        // Clean: 10–80 NTU (below threshold → servo + pump)
-        ntu = random(0, 50);
+    if (!got_value) {
+        Serial.println("[SENSOR] WARNING: Arduino Uno did not respond — turbidity = 0 NTU (safe default)");
+        Serial1.end();
+        return 0.0f;
     }
-    Serial.printf("[SENSOR] Turbidity (random demo): %.1f NTU\n", ntu);
-    return ntu;
+
+    // Send echo confirmation so the Arduino knows the value was received.
+    Serial1.print('E');
+    Serial1.println(raw_adc);
+    Serial1.flush();
+    Serial1.end();
+
+    Serial.printf("[SENSOR] Turbidity ADC from Arduino: %d\n", raw_adc);
+
+    // Convert raw ADC to NTU with temperature viscosity correction.
+    int   adc_clamped = constrain(raw_adc, TURB_DIRTY_ADC, TURB_CLEAN_ADC);
+    float ntu_raw     = TURB_MAX_NTU *
+                        (float)(TURB_CLEAN_ADC - adc_clamped) /
+                        (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
+    float correction  = 1.0f + 0.005f * (temp_c - 25.0f);
+    return constrain(ntu_raw / correction, 0.0f, TURB_MAX_NTU);
 }
 
 // ── servoMove – software PWM ──────────────────────────────────────────────
@@ -243,10 +272,13 @@ void setup() {
 
     float water_temp = safeTemp(tempSensor.getTempCByIndex(0));
 
-    // ── Turbidity reading with WiFi OFF ───────────────────────────────────
-    // ADC is sensitive to RF noise; read before enabling the radio.
-    // NOTE: using randomised value for demo purposes (see readTurbidityRandom)
-    float turbidity_ntu = readTurbidityRandom();
+    // ── Turbidity reading via Arduino Uno (Serial1, WiFi still OFF) ───────
+    // Serial1 communication happens here, before WiFi init, for two reasons:
+    //   1. The Arduino Uno's analog read is less susceptible to RF noise
+    //      when the ESP32 radio is off.
+    //   2. The 4.5-second timeout fits naturally in the boot sequence without
+    //      blocking the ESP-NOW link (which hasn't been created yet).
+    float turbidity_ntu = readTurbidityFromArduino(water_temp);
     int   turbidity_pct = (int)((turbidity_ntu / TURB_MAX_NTU) * 100.0f);
 
     // ── WiFi + ESP-NOW init ───────────────────────────────────────────────
@@ -278,7 +310,7 @@ void setup() {
     sendMsg("LOG", "────────────────────────────────────");
     sendMsg("LOG", "[BOOT] #" + String(bootCount));
     sendMsg("LOG", "[SENSOR] Turbidity : " + String(turbidity_ntu, 1) +
-            " NTU  (" + String(turbidity_pct) + "%)");
+            " NTU  (" + String(turbidity_pct) + "%)  [Arduino Uno sensor]");
     sendMsg("LOG", "[SENSOR] Water temp: " + String(water_temp, 1) + " C");
     sendMsg("DATA", "SENSOR:" + String(turbidity_ntu, 1) +
             "," + String(water_temp, 1));
@@ -319,7 +351,7 @@ void setup() {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
-                float live_turb = readTurbidityRandom();
+                float live_turb = turbidity_ntu;  // re-use boot reading; turbidity changes slowly
                 sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
                         "," + String(live_temp, 1));
             }
@@ -329,7 +361,7 @@ void setup() {
 
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
-    } else if (turbidity_ntu > TURB_THRESHOLD_NTU) {
+    } else if (turbidity_ntu <= TURB_THRESHOLD_NTU) {
         // ── Dirty water: pump ON with anomaly monitoring ──────────────────
         sendMsg("LOG", "[ACTION] Turbidity=" + String(turbidity_ntu, 1) +
                 " NTU > threshold → pump ON (10 s)");
@@ -348,7 +380,7 @@ void setup() {
                 tempSensor.requestTemperatures();
                 // Guard -127: use last valid temperature if probe glitches
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
-                float live_turb = readTurbidityRandom();
+                float live_turb = turbidity_ntu;  // re-use boot reading; turbidity changes slowly
                 sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
                         "," + String(live_temp, 1));
             }
@@ -358,7 +390,7 @@ void setup() {
 
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
-    } else {
+    } else if (turbidity_ntu >  TURB_THRESHOLD_NTU) {
         // ── Clean water: dispense food with servo, then run pump briefly ──
         sendMsg("LOG", "[ACTION] Water clean (" + String(turbidity_ntu, 1) + " NTU) → dispensing food + short pump cycle");
 
@@ -386,7 +418,7 @@ void setup() {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
-                float live_turb = readTurbidityRandom();
+                float live_turb = turbidity_ntu;  // re-use boot reading; turbidity changes slowly
                 sendMsg("DATA", "SENSOR:" + String(live_turb, 1) +
                         "," + String(live_temp, 1));
             }

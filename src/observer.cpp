@@ -1,22 +1,18 @@
 /*
- * FLOAT - Observer Node
- * =====================
+ * FLOAT - Observer Node (v9)
+ * ===========================
  * Reads motor current via INA219, detects anomalies using EWMA + Hampel filter,
  * and communicates with the Target node over ESP-NOW (channel 13).
  *
- * Anomaly types: MOTOR_STALL, DRY_RUN, VOLTAGE_DROP, TEMP_TOO_HIGH, TEMP_TOO_LOW
+ * Anomaly policy:
+ *   MOTOR_STALL  — pump halted immediately (10× HALT burst, system_locked)
+ *   DRY_RUN      — pump halted immediately (no water in system)
+ *   VOLTAGE_DROP — buzzer warning only; pump keeps running
+ *                  (momentary voltage dip should not interrupt filtration)
+ *   TEMP_TOO_HIGH/LOW — buzzer warning only; operator must act on heater/cooler
  *
- * Changes vs previous version:
- * - Temperature guard: invalid readings (< -10 °C) are discarded; last
- * valid temperature is kept to prevent false temperature alarms
- * - EWMA is reset to current raw value when grace period ends, preventing
- * motor inrush current from carrying over into monitoring
- * - Hampel filter replaces robustStats for robust baseline calibration
- * - ACK handshake: replies ACK:N when a message with |ID:N| is received
- * - DRY_RUN threshold: 30 % of baseline mean current
- * - Dynamic temperature thresholds: learned from aquarium baseline during
- * the calibration phase using the same Hampel filter as current.
- * Safety floors: alarm never fires below 30 °C (high) or above 15 °C (low).
+ * Z-score removed: thresholds are absolute (μ±kσ from Hampel calibration),
+ * no need to recompute it on every tick.
  */
 
 #include <Arduino.h>
@@ -325,8 +321,9 @@ void setup() {
     esp_now_add_peer(&peer);
 
     Serial.println("\n╔══════════════════════════════════════════════╗");
-    Serial.println("║  FLOAT  –  Observer Node (v8)               ║");
+    Serial.println("║  FLOAT  –  Observer Node (v9)               ║");
     Serial.println("║  EWMA+Hampel | DRY_RUN | Dynamic TEMP       ║");
+    Serial.println("║  VOLT/TEMP = warning only (no halt)         ║");
     Serial.println("╚══════════════════════════════════════════════╝");
 }
 
@@ -393,9 +390,6 @@ void loop() {
             return;
         }
 
-        float z_score   = (baseline_std > 1e-6f)
-                          ? (ewma_current - baseline_mean) / baseline_std : 0.0f;
-        
         bool stall_flag     = (ewma_current > th_stall);
         bool volt_flag      = (th_volt_min > 0.1f && last_voltage < th_volt_min);
         bool dry_flag       = (th_dry_run  > 0.1f && ewma_current < th_dry_run);
@@ -403,7 +397,6 @@ void loop() {
         bool temp_high_flag = false;
         bool temp_low_flag  = false;
         
-        // FIX: Sostituito DEVICE_DISCONNECTED_C con -127.0f
         if (last_temp_c != -127.0f && last_temp_c > -10.0f) {
             temp_high_flag = (last_temp_c > th_temp_high);
             temp_low_flag  = (last_temp_c < th_temp_low);
@@ -420,9 +413,9 @@ void loop() {
                        (dry_confirm >= CONFIRM_NEEDED) || 
                        (temp_confirm >= CONFIRM_NEEDED);
 
-        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  Z=%+.2f  V=%.2f  T=%.1f"
+        Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  V=%.2f  T=%.1f"
                       "  thr[↑%.1f↓%.1f]  [S:%d V:%d D:%d T:%d]%s%s%s%s%s\n",
-                      last_current, ewma_current, z_score, last_voltage, last_temp_c,
+                      last_current, ewma_current, last_voltage, last_temp_c,
                       th_temp_high, th_temp_low,
                       stall_confirm, volt_confirm, dry_confirm, temp_confirm,
                       stall_flag      ? " STALL"     : "",
@@ -439,12 +432,19 @@ void loop() {
             else                                      anomaly_reason = "TEMP_TOO_LOW";
 
             Serial.printf("\n[!!!] ANOMALY CONFIRMED: %s\n", anomaly_reason.c_str());
-            Serial.printf("   I_ewma=%.2f mA  Z=%+.2f  V=%.2f V  T=%.1f C"
+            Serial.printf("   I_ewma=%.2f mA  V=%.2f V  T=%.1f C"
                           "  (thr ↑%.1f ↓%.1f)\n",
-                          ewma_current, z_score, last_voltage, last_temp_c,
+                          ewma_current, last_voltage, last_temp_c,
                           th_temp_high, th_temp_low);
 
-            if (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN" || anomaly_reason == "VOLTAGE_DROP") {
+            // MOTOR_STALL and DRY_RUN halt the system immediately — pump must stop.
+            // VOLTAGE_DROP, TEMP_TOO_HIGH, TEMP_TOO_LOW are warnings:
+            //   buzzer alerts the operator but the pump keeps running, because:
+            //   - Low voltage may be a momentary dip (battery, wiring); stopping
+            //     the pump mid-cycle could leave the aquarium unfiltered.
+            //   - Temperature is outside the safe range but the pump itself is healthy;
+            //     the operator needs to intervene (heater/cooler), not stop the pump.
+            if (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN") {
                 for (int i = 0; i < 10; i++) { espNowSend("HALT"); delay(5); }
                 system_locked = true;
             }
@@ -455,7 +455,10 @@ void loop() {
 
             buzzerAlert(3);
             
+            // For non-halting anomalies, reset their confirm counter so the next
+            // check starts fresh (avoids a continuous stream of alerts).
             if (!system_locked) {
+                volt_confirm = 0;
                 temp_confirm = 0;
             }
         }
