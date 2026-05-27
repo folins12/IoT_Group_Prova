@@ -43,8 +43,8 @@ const int TURB_TXD = 5;
 // These constants must match the physical sensor calibration.
 // TURB_CLEAN_ADC : ADC value in perfectly clean water (high voltage = clear)
 // TURB_DIRTY_ADC : ADC value in very dirty water (low voltage = turbid)
-const int   TURB_CLEAN_ADC     = 3435;  // ← adjust after physical calibration
-const int   TURB_DIRTY_ADC     = 1200;
+const int   TURB_CLEAN_ADC     = 750;  // ← adjust after physical calibration
+const int   TURB_DIRTY_ADC     = 10;
 const float TURB_MAX_NTU       = 800.0f;
 const float TURB_THRESHOLD_NTU = 50.0f;
 
@@ -204,9 +204,9 @@ float readTurbidityFromArduino(float temp_c = 25.0f) {
 
     // Convert raw ADC to NTU with temperature viscosity correction.
     int   adc_clamped = constrain(raw_adc, TURB_DIRTY_ADC, TURB_CLEAN_ADC);
-    float ntu_raw     = TURB_MAX_NTU *
-                        (float)(TURB_CLEAN_ADC - adc_clamped) /
-                        (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
+    float ntu_raw = TURB_MAX_NTU *
+                (float)(adc_clamped - TURB_DIRTY_ADC) /
+                (float)(TURB_CLEAN_ADC - TURB_DIRTY_ADC);
     float correction  = 1.0f + 0.005f * (temp_c - 25.0f);
     return constrain(ntu_raw / correction, 0.0f, TURB_MAX_NTU);
 }
