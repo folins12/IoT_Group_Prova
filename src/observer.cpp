@@ -19,9 +19,22 @@
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>  // Required for advanced radio control
 #include <math.h>
+#include "dashboard.h"
+
+// ── WiFi credentials ──────────────────────────────────────────────────────
+// Observer joins this network as STA so the dashboard is reachable at the IP
+// printed on serial at boot. The target also references this same SSID to
+// discover the channel — no dedicated AP needed. To switch networks (e.g.
+// home WiFi instead of hotspot) just edit these two constants in BOTH files
+// in sync. If the network is not found at boot the system falls back to the
+// hardcoded channel 13 used by the original v9 — ESP-NOW keeps working,
+// just without dashboard.
+const char* WIFI_SSID = "iPhone di Michele";
+const char* WIFI_PASS = "Michele4!";
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int I2C_SDA     = 41;
@@ -30,6 +43,7 @@ const int BUZZER_PIN  = 7;
 
 // ── Hardware ───────────────────────────────────────────────────────────────
 Adafruit_INA219 ina219;
+WebServer       server(80);   // HTTP server for the dashboard
 
 // ── ESP-NOW peer (Target node MAC address) ────────────────────────────────
 uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
@@ -80,6 +94,39 @@ const int CONFIRM_NEEDED = 3;
 float last_current  = 0.0f;
 float last_voltage  = 0.0f;
 float last_temp_c   = 25.0f;  // default; updated from Target DATA:SENSOR messages
+float last_turb     = 0.0f;   // turbidity for dashboard (parsed from DATA:SENSOR)
+
+// ── Event ring buffer for the dashboard ───────────────────────────────────
+// Fixed char[] buffer, no heap/String — safe to write from inside the
+// ESP-NOW receive callback. portMUX_TYPE guards inter-core access between
+// the WiFi task (which runs the callback) and the main loop.
+struct EvtEntry { uint32_t id; uint32_t ts; char type[14]; char msg[116]; };
+const int EVT_MAX = 40;
+EvtEntry  evt_buf[EVT_MAX];
+int       evt_head = 0, evt_count = 0;
+uint32_t  evt_seq  = 0;
+portMUX_TYPE evt_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void push_event(const char* type, const char* msg) {
+    portENTER_CRITICAL(&evt_mux);
+    evt_seq++;
+    EvtEntry& e = evt_buf[evt_head];
+    e.id = evt_seq;
+    e.ts = (uint32_t)millis();
+    strncpy(e.type, type, 13); e.type[13] = '\0';
+    strncpy(e.msg,  msg, 115); e.msg[115] = '\0';
+    evt_head = (evt_head + 1) % EVT_MAX;
+    if (evt_count < EVT_MAX) evt_count++;
+    portEXIT_CRITICAL(&evt_mux);
+}
+
+// Classify Target LOG lines into dashboard categories by keyword.
+void push_log_event(const char* txt) {
+    const char* type = "log";
+    if (strstr(txt, "[WARN]") || strstr(txt, "[HALT]") || strstr(txt, "[CRITICAL]"))
+        type = "anomaly";
+    push_event(type, txt);
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -160,13 +207,17 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 
     if (s.startsWith("LOG:")) {
-        Serial.println(s.substring(4));
+        String log_text = s.substring(4);
+        Serial.println(log_text);
+        push_log_event(log_text.c_str());   // forward to dashboard
 
     } else if (s.startsWith("DATA:SENSOR:")) {
         String payload    = s.substring(12);
         int    commaIndex = payload.indexOf(',');
         if (commaIndex != -1) {
+            float received_turb = payload.substring(0, commaIndex).toFloat();
             float received_temp = payload.substring(commaIndex + 1).toFloat();
+            if (received_turb >= 0.0f) last_turb = received_turb;
             if (received_temp > -10.0f) {
                 last_temp_c = received_temp;
                 if (current_mode == "LEARNING" && temp_sample_idx < MAX_SAMPLES) {
@@ -187,6 +238,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         new_temp_for_learn   = false;
         memset(temp_samples, 0, sizeof(temp_samples));
         Serial.println("[OBS] MODE → LEARNING");
+        push_event("phase", "LEARNING — calibrating pump baseline");
 
     } else if (s == "CMD:START_MONITOR") {
         if (!is_calibrated) {
@@ -203,6 +255,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         ewma_init       = false;  
         grace_period    = 4;
         Serial.println("[OBS] MODE → MONITORING");
+        push_event("phase", "MONITORING — anomaly detection active");
 
     } else if (s == "CMD:STOP_MEASURE") {
         if (current_mode == "LEARNING" && sample_idx > 5) {
@@ -262,8 +315,15 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
                      baseline_mean, baseline_std, th_stall, th_dry_run,
                      th_temp_high, th_temp_low);
             espNowSend(buf);
+
+            char notif[120];
+            snprintf(notif, sizeof(notif),
+                     "Calibration done — μ=%.1f mA  stall=%.1f  T[%.1f-%.1f]°C",
+                     baseline_mean, th_stall, th_temp_low, th_temp_high);
+            push_event("calibration", notif);
         }
         current_mode = "IDLE";
+        push_event("phase", "IDLE — waiting for next target cycle");
 
     } else if (s == "CMD:RESET") {
         system_locked   = false;
@@ -279,6 +339,88 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         digitalWrite(BUZZER_PIN, LOW);
         Serial.println("[OBS] System reset by dashboard command");
     }
+}
+
+// ── HTTP handlers ─────────────────────────────────────────────────────────
+// HTML is streamed in 1 KB chunks via sendContent_P to avoid a 7 KB heap
+// allocation on every page load (which under load would fragment the heap
+// and trigger watchdog resets).
+void handleRoot() {
+    size_t total = strlen(html_page);
+    server.setContentLength(total);
+    server.send(200, "text/html", "");
+    const char* p = html_page;
+    size_t left = total;
+    while (left > 0) {
+        size_t n = left > 1024 ? 1024 : left;
+        server.sendContent_P(p, n);
+        p += n;
+        left -= n;
+        yield();
+    }
+}
+
+void handleData() {
+    char buf[400];
+    snprintf(buf, sizeof(buf),
+        "{\"I\":%.2f,\"I_ewma\":%.2f,\"V\":%.2f,\"T\":%.2f,\"turb\":%.1f"
+        ",\"mode\":\"%s\",\"locked\":%s"
+        ",\"th_stall\":%.2f,\"th_dry\":%.2f,\"th_thi\":%.2f,\"th_tlo\":%.2f"
+        ",\"evt_seq\":%lu}",
+        last_current, ewma_current, last_voltage, last_temp_c, last_turb,
+        current_mode.c_str(),
+        system_locked ? "true" : "false",
+        th_stall, th_dry_run, th_temp_high, th_temp_low,
+        (unsigned long)evt_seq);
+    server.send(200, "application/json", buf);
+}
+
+void handleEvents() {
+    uint32_t last_id = server.hasArg("last")
+                       ? (uint32_t)server.arg("last").toInt() : 0;
+    // Snapshot under critical section, then format JSON outside it.
+    static EvtEntry snap[EVT_MAX];
+    int snap_count, snap_start;
+    portENTER_CRITICAL(&evt_mux);
+    snap_count = evt_count;
+    snap_start = (evt_head - evt_count + EVT_MAX) % EVT_MAX;
+    for (int i = 0; i < snap_count; i++) snap[i] = evt_buf[(snap_start + i) % EVT_MAX];
+    portEXIT_CRITICAL(&evt_mux);
+
+    static char buf[2048];
+    int pos = 0, sent = 0;
+    buf[pos++] = '[';
+    bool first = true;
+    for (int i = 0; i < snap_count && sent < 15; i++) {
+        const EvtEntry& e = snap[i];
+        if (e.id <= last_id) continue;
+        char safe[120]; int si = 0;
+        for (int k = 0; e.msg[k] && si < 116; k++) {
+            if (e.msg[k] == '"' || e.msg[k] == '\\') safe[si++] = '\\';
+            safe[si++] = e.msg[k];
+        }
+        safe[si] = '\0';
+        int w = snprintf(buf + pos, (int)sizeof(buf) - pos - 4,
+            "%s{\"id\":%lu,\"ts\":%lu,\"type\":\"%s\",\"msg\":\"%s\"}",
+            first ? "" : ",",
+            (unsigned long)e.id, (unsigned long)e.ts, e.type, safe);
+        if (w <= 0 || pos + w >= (int)sizeof(buf) - 4) break;
+        pos += w; first = false; sent++;
+    }
+    buf[pos++] = ']'; buf[pos] = '\0';
+    server.send(200, "application/json", buf);
+}
+
+// smartDelay: like delay() but keeps the WebServer responsive. We replace the
+// blocking delay() calls in loop() with this so HTTP polling is never
+// starved while the observer waits between sensor ticks. Logic and timing
+// of loop() are unchanged.
+void smartDelay(unsigned long ms) {
+    unsigned long t0 = millis();
+    do {
+        server.handleClient();
+        delay(2);
+    } while (millis() - t0 < ms);
 }
 
 // ── setup ──────────────────────────────────────────────────────────────────
@@ -299,13 +441,37 @@ void setup() {
         while (1) delay(100);
     }
 
+    // ── WiFi STA + ESP-NOW ─────────────────────────────────────────────────
+    // STA-only mode (no AP) so the dashboard is reachable on the user's
+    // existing network. The radio's channel is dictated by the router/hotspot;
+    // we read it back and pin ESP-NOW to that same channel. The target does
+    // the same scan independently, so both ESP32s converge on the same
+    // channel without any dedicated discovery AP.
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    WiFi.setSleep(false);   // disable modem sleep — critical for reliable ESP-NOW
+                            // reception while connected to a WiFi AP (matches what
+                            // target.cpp already does on its own setup)
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[OBS] Connecting to '%s'", WIFI_SSID);
+    unsigned long t0_wifi = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0_wifi < 15000) {
+        delay(400); Serial.print(".");
+    }
 
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
+    uint8_t esp_now_channel = 13;   // fallback (matches the v9 default)
+    if (WiFi.status() == WL_CONNECTED) {
+        uint8_t pri; wifi_second_chan_t sec;
+        esp_wifi_get_channel(&pri, &sec);
+        esp_now_channel = pri;
+        Serial.printf("\n[OBS] WiFi OK — channel %d, dashboard at http://%s\n",
+                      esp_now_channel, WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("\n[OBS] WiFi not found — fallback channel 13 (no dashboard)");
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+    }
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[OBS] ESP-NOW init failed");
@@ -316,9 +482,21 @@ void setup() {
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(peer));
     memcpy(peer.peer_addr, targetAddress, 6);
-    peer.channel = 13;
+    peer.channel = esp_now_channel;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
+
+    // Register HTTP routes; quick 204 for /favicon.ico and other unknowns.
+    server.on("/",            HTTP_GET, handleRoot);
+    server.on("/data",        HTTP_GET, handleData);
+    server.on("/events",      HTTP_GET, handleEvents);
+    // Browsers automatically request /favicon.ico — registering an explicit
+    // empty handler silences the WebServer "request handler not found" log.
+    server.on("/favicon.ico", HTTP_GET, [](){ server.send(204, "text/plain", ""); });
+    server.onNotFound([](){ server.send(204, "text/plain", ""); });
+    server.begin();
+
+    push_event("phase", "IDLE — system online");
 
     Serial.println("\n╔══════════════════════════════════════════════╗");
     Serial.println("║  FLOAT  –  Observer Node (v9)               ║");
@@ -329,6 +507,8 @@ void setup() {
 
 // ── loop ───────────────────────────────────────────────────────────────────
 void loop() {
+    server.handleClient();   // serve dashboard HTTP traffic every iteration
+
     float raw_current = ina219.getCurrent_mA();
     float bus_voltage = ina219.getBusVoltage_V();
 
@@ -358,7 +538,7 @@ void loop() {
                  last_current, last_voltage, last_temp_c, anomaly_reason.c_str());
         espNowSend(buf);
         buzzerAlert(1);
-        delay(5000);
+        smartDelay(5000);
         return;
     }
 
@@ -373,7 +553,7 @@ void loop() {
             Serial.printf("   [LEARN] #%d  I=%.2f mA  V=%.2f V  T=%.2f C\n",
                           row, last_current, last_voltage, last_temp_c);
         }
-        delay(300);
+        smartDelay(300);
         return;
     }
 
@@ -386,7 +566,7 @@ void loop() {
                 ewma_current = last_current;
                 Serial.printf("   [MON] Grace period ended — EWMA seeded at %.1f mA\n", ewma_current);
             }
-            delay(400);
+            smartDelay(400);
             return;
         }
 
@@ -468,7 +648,7 @@ void loop() {
                  last_current, last_voltage, last_temp_c);
         espNowSend(buf);
 
-        delay(400);
+        smartDelay(400);
         return;
     }
 
@@ -479,5 +659,5 @@ void loop() {
              last_current, last_voltage, last_temp_c);
     espNowSend(buf);
 
-    delay(2000);
+    smartDelay(2000);
 }

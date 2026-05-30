@@ -244,6 +244,32 @@ float safeTemp(float raw) {
     return raw;
 }
 
+// ── WiFi channel discovery ─────────────────────────────────────────────────
+// The Observer joins this WiFi network and ESP-NOW lands on whatever channel
+// the router/hotspot picks. We scan for the same SSID and pin our radio to
+// the channel found, so both ESP32s talk on the same channel without any
+// dedicated discovery AP. MUST MATCH the WIFI_SSID in observer.cpp.
+const char* WIFI_SSID = "iPhone di Michele";
+
+uint8_t findChannel() {
+    for (int attempt = 0; attempt < 5; attempt++) {
+        Serial.printf("[TGT] Scanning for '%s' (try %d/5)...\n", WIFI_SSID, attempt + 1);
+        int n = WiFi.scanNetworks(false, false);   // sync, visible only
+        for (int i = 0; i < n; i++) {
+            if (WiFi.SSID(i) == WIFI_SSID) {
+                uint8_t ch = WiFi.channel(i);
+                Serial.printf("[TGT] Found '%s' on channel %d\n", WIFI_SSID, ch);
+                WiFi.scanDelete();
+                return ch;
+            }
+        }
+        WiFi.scanDelete();
+        delay(400);
+    }
+    Serial.println("[TGT] Network not found — fallback channel 13 (v9 default)");
+    return 13;
+}
+
 // ── setup ──────────────────────────────────────────────────────────────────
 void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
@@ -287,8 +313,13 @@ void setup() {
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
+    // Discover the WiFi channel by scanning for WIFI_SSID (the same network
+    // the Observer joins). ESP-NOW will then run on that channel — no need
+    // for a hardcoded value, works with any router/hotspot.
+    uint8_t obs_channel = findChannel();
+
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_channel(obs_channel, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
 
     if (esp_now_init() == ESP_OK) {
@@ -296,7 +327,7 @@ void setup() {
         esp_now_peer_info_t peer;
         memset(&peer, 0, sizeof(peer));
         memcpy(peer.peer_addr, observerAddress, 6);
-        peer.channel = 13;
+        peer.channel = obs_channel;
         peer.encrypt = false;
         esp_now_add_peer(&peer);
     } else {
