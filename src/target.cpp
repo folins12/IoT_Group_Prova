@@ -20,6 +20,7 @@
  */
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -27,6 +28,16 @@
 #include <DallasTemperature.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+
+// ── Preferences (NVS) ──────────────────────────────────────────────────────
+// RTC_DATA_ATTR survives deep sleep but NOT power glitches (a pump-stall
+// brownout will wipe it). NVS lives in flash and survives everything,
+// so we mirror critical state (halted, default-mode) here too.
+Preferences prefs;
+bool autoCycleEnabled = true;   // mirrored in NVS as "auto"
+volatile bool restart_requested = false;   // set by AUTO_ON_RESET in callback;
+                                            // ESP.restart() is performed outside
+                                            // the callback (in loop() / end-of-cycle).
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int PUMP_PIN      = 47;
@@ -82,6 +93,43 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         emergency_stop = true;
         system_halted  = true;
         anomaly_count++;
+        prefs.putBool("halted", true);   // persist across power loss
+    } else if (s == "CMD:AUTO_OFF") {
+        // Dashboard toggle moved to OFF → stop the default cycle.
+        // Effect takes hold from the NEXT wake (current action completes).
+        if (autoCycleEnabled) {
+            autoCycleEnabled = false;
+            prefs.putBool("auto", false);
+            Serial.println("[TGT] Default mode → OFF (system will idle next wake)");
+        }
+    } else if (s == "CMD:AUTO_ON") {
+        // Dashboard toggle confirmed ON. No state reset — just remember.
+        if (!autoCycleEnabled) {
+            autoCycleEnabled = true;
+            prefs.putBool("auto", true);
+            Serial.println("[TGT] Default mode → ON");
+        }
+    } else if (s == "CMD:AUTO_ON_RESET") {
+        // Dashboard toggle moved OFF → ON: full reset for a clean cycle.
+        //
+        // Key trick: we set bootCount = 0 here and trigger a software restart.
+        // RTC_DATA_ATTR (bootCount) survives ESP.restart() but not POWERON, so
+        // after the restart setup() runs again with bootCount = 0 → learning.
+        //
+        // We CANNOT use bootCount = -1 (relying on goToSleep to increment to 0)
+        // because the handler may run mid-setup, before main logic checks
+        // bootCount. With bootCount = -1 in setup, main logic would fall through
+        // to the `else` branch (pump cycle, no learning) — exactly the bug we
+        // saw in the previous run when the toggle ON triggered a stall.
+        autoCycleEnabled  = true;
+        bootCount         = 0;
+        system_halted     = false;
+        anomaly_count     = 0;
+        consecutive_noack = 0;
+        prefs.putBool("auto",   true);
+        prefs.putBool("halted", false);
+        restart_requested = true;
+        Serial.println("[TGT] Default mode → ON + RESET (restart pending)");
     } else if (s.startsWith("ACK:")) {
         acked_id     = (uint32_t)s.substring(4).toInt();
         ack_received = true;
@@ -282,12 +330,17 @@ void setup() {
     digitalWrite(PUMP_PIN,  LOW);
     digitalWrite(SERVO_PIN, LOW);
 
-    // ── System halted by a critical anomaly ───────────────────────────────
-    if (system_halted) {
-        Serial.println("[TGT] System halted — staying in deep sleep.");
-        esp_sleep_enable_timer_wakeup(SLEEP_US);
-        esp_deep_sleep_start();
-    }
+    // ── Load persistent state from NVS ────────────────────────────────────
+    // RTC vars survive deep sleep but a brownout from pump stall wipes them.
+    // NVS lives in flash and survives any reset, so it's our source of truth
+    // for halted state and default-mode toggle. The actual decision to sleep
+    // (when halted) or skip the cycle (when auto=false) is taken LATER, after
+    // ESP-NOW is up and we've had a chance to receive AUTO_ON_RESET — without
+    // that grace window the target would deep-sleep before ever hearing the
+    // dashboard, and the user could never recover from a HALT.
+    prefs.begin("float", false);
+    if (!system_halted) system_halted = prefs.getBool("halted", false);
+    autoCycleEnabled = prefs.getBool("auto", true);
 
     // ── DS18B20 reading (before WiFi to avoid losing conversion window) ───
     tempSensor.begin();
@@ -359,9 +412,57 @@ void setup() {
         goToSleep(60ULL * 1000000ULL);  // long sleep, reduce power without hard-halting
     }
 
+    // ── Wait briefly for any state command from the Observer ──────────────
+    // Observer piggy-backs HALT (if it's locked), CMD:AUTO_OFF/AUTO_ON/
+    // AUTO_ON_RESET (toggle changes) on every incoming message from us. The
+    // DATA:SENSOR we just sent triggers it, so a short delay lets the callback
+    // land and update system_halted / autoCycleEnabled before we decide what
+    // to do next.
+    delay(800);
+
+    // ── Decision after grace window ───────────────────────────────────────
+
+    // Halted (either from NVS at boot OR set by a HALT just received above).
+    // Note: AUTO_ON_RESET (handled in callback) clears system_halted, so the
+    // user can recover from HALT by toggling the dashboard OFF → ON.
+    if (system_halted) {
+        sendMsg("LOG", "[HALT] Target halted — back to deep sleep. "
+                       "Toggle Default mode OFF/ON from the dashboard to recover.");
+        goToSleep();
+    }
+
+    // A restart was requested by AUTO_ON_RESET — perform it cleanly here,
+    // before doing any cycle work that would be wasted by an imminent reboot.
+    if (restart_requested) {
+        Serial.println("[TGT] Restart requested — rebooting for fresh state");
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+    }
+
+    // Default mode OFF: do NOT deep-sleep. Return from setup() so loop() takes
+    // over and the device stays awake indefinitely, listening on ESP-NOW for
+    // an AUTO_ON_RESET to come back online. This is the "stay in IDLE forever"
+    // behavior the user asked for — no periodic boots while paused.
+    if (!autoCycleEnabled) {
+        sendMsg("LOG", "[IDLE] Default mode OFF — staying awake, no boots until toggled ON");
+        return;
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // MAIN LOGIC
     // ══════════════════════════════════════════════════════════════════════
+
+    // ── SAFETY LATCH ON ───────────────────────────────────────────────────
+    // Write halted=true to NVS BEFORE any pump activation. If something goes
+    // wrong during the cycle — observer's HALT lost due to radio drop, voltage
+    // brownout from stall current, target spontaneously resetting, anything —
+    // the NVS state will keep the target halted on its next boot. The latch
+    // is cleared further down ONLY if the cycle completes cleanly (no anomaly).
+    // This is the primary fix for the "pump turns on after HALT" bug, since
+    // it doesn't rely on HALT reaching the target during the noisiest moment
+    // (high pump current + voltage sag).
+    prefs.putBool("halted", true);
 
     if (bootCount == 0) {
         // ── First boot: calibration learning phase ────────────────────────
@@ -460,8 +561,65 @@ void setup() {
         sendMsg("LOG", "[PUMP] Short cycle done");
     }
 
-    // ── End of cycle: deep sleep ───────────────────────────────────────────
+    // ── End of cycle ──────────────────────────────────────────────────────
+
+    // SAFETY LATCH OFF: only clear halted=true if the cycle completed without
+    // any anomaly. The 500ms wait gives the Observer one last chance to push
+    // a HALT we might have missed earlier (e.g., its first HALT was lost
+    // during the high-current transient).
+    delay(500);
+    if (!emergency_stop && !system_halted) {
+        prefs.putBool("halted", false);
+    } else {
+        sendMsg("LOG", "[LATCH] Anomaly detected during cycle — halted state persisted");
+    }
+
+    // AUTO_OFF received mid-cycle: stay awake instead of sleeping. loop() will
+    // hold the device until the user toggles ON again.
+    if (!autoCycleEnabled) {
+        sendMsg("LOG", "[IDLE] Default mode switched OFF during cycle — staying awake");
+        return;
+    }
+
+    // AUTO_ON_RESET received mid-cycle: do a clean reboot so the next setup()
+    // sees bootCount=0 from RTC and runs a fresh learning cycle.
+    if (restart_requested) {
+        Serial.println("[TGT] Restart requested — rebooting for fresh state");
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+    }
+
     goToSleep();
 }
 
-void loop() {}
+// ── loop ───────────────────────────────────────────────────────────────────
+// In normal default-mode ON, setup() ends with goToSleep() and loop() is never
+// reached. In default-mode OFF, setup() returns early so loop() runs forever
+// — the device stays awake on ESP-NOW, waiting for an AUTO_ON_RESET to come
+// back online. When that arrives (in the receive callback), it sets
+// restart_requested = true; we pick it up here and do a clean ESP.restart()
+// to begin a fresh cycle with bootCount = 0 → learning.
+void loop() {
+    if (restart_requested) {
+        Serial.println("[TGT] Restart requested — rebooting for fresh state");
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+    }
+    // In default-mode OFF the target stays awake; it cannot wake-and-poll like
+    // it does between cycles. The Observer only ever sends to us in RESPONSE to
+    // one of our messages (piggy-back), so a silent target can never be told to
+    // come back ON. We therefore ping the Observer every 2 s with our current
+    // state ("HB:OFF"). The Observer reconciles: if the dashboard wants ON but
+    // we report OFF, it pushes CMD:AUTO_ON_RESET and we reboot into a fresh
+    // cycle. Reporting our state (rather than a bare ping) is what makes OFF→ON
+    // work even after either node has been physically reset and the transient
+    // pendingTargetCmd has been lost.
+    static unsigned long last_hb = 0;
+    if (millis() - last_hb >= 2000) {
+        last_hb = millis();
+        sendMsg("HB", "OFF");
+    }
+    delay(100);
+}

@@ -16,6 +16,7 @@
  */
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <WiFi.h>
@@ -25,7 +26,7 @@
 #include <math.h>
 #include "dashboard.h"
 
-// ── WiFi credentials ──────────────────────────────────────────────────────
+// ── WiFi credentials ───────────────────────────────────────────────────────
 // Observer joins this network as STA so the dashboard is reachable at the IP
 // printed on serial at boot. The target also references this same SSID to
 // discover the channel — no dedicated AP needed. To switch networks (e.g.
@@ -35,6 +36,19 @@
 // just without dashboard.
 const char* WIFI_SSID = "iPhone di Michele";
 const char* WIFI_PASS = "Michele4!";
+
+// ── Default-mode (dashboard toggle) ────────────────────────────────────────
+// autoMode = true  → the predefined cycle (learning → sleep → pump/feeding →
+//                    sleep → …) runs autonomously, exactly as in v9.
+// autoMode = false → the cycle is suspended; system sits in IDLE awaiting
+//                    explicit commands from the dashboard (buttons TBD).
+// The state is persisted in NVS (survives any reset). When the user toggles
+// OFF→ON the Observer resets its own state AND tells the target to wipe its
+// own counters so the next cycle starts fresh from learning.
+Preferences   obsPrefs;
+bool          autoMode            = true;
+const char*   pendingTargetCmd    = nullptr;   // ESP-NOW string to forward
+int           pendingTargetCount  = 0;          // send N times for reliability
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int I2C_SDA     = 41;
@@ -197,6 +211,32 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     msg[len] = '\0';
     String s(msg);
 
+    // ── HALT echo (safety net) ───────────────────────────────────────────
+    // If we're locked we keep telling the target so on every single message
+    // it sends us. This covers the scenario in which the original HALT
+    // (sent right at stall confirmation) was lost because of the voltage
+    // sag / radio drop caused by the stall itself. On any subsequent target
+    // boot, the very first message (a [BOOT] log) triggers this echo and
+    // the target sets its NVS halted flag, going back to sleep at the next
+    // gate in setup(). The check is BEFORE the pending-cmd block because
+    // an AUTO_ON_RESET (which clears system_locked first) must not be
+    // shadowed by a stale HALT.
+    if (system_locked) {
+        esp_now_send(mac, (const uint8_t*)"HALT", 4);
+    }
+
+    // ── Piggy-back pending default-mode command to the target ────────────
+    // When the dashboard toggle changes, we don't know when the target will
+    // be awake. Instead of polling, we ride along on any message the target
+    // sends us and reply with the current state command. pendingTargetCount
+    // (default 5) ensures we keep sending for several incoming messages so
+    // at least one reliably reaches the target.
+    if (pendingTargetCmd != nullptr && pendingTargetCount > 0) {
+        esp_now_send(mac, (const uint8_t*)pendingTargetCmd, strlen(pendingTargetCmd));
+        pendingTargetCount--;
+        if (pendingTargetCount == 0) pendingTargetCmd = nullptr;
+    }
+
     int id_pos = s.indexOf("|ID:");
     if (id_pos != -1) {
         uint32_t msg_id = (uint32_t)s.substring(id_pos + 4).toInt();
@@ -204,6 +244,21 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         char ack_buf[32];
         snprintf(ack_buf, sizeof(ack_buf), "ACK:%lu", (unsigned long)msg_id);
         esp_now_send(mac, (const uint8_t*)ack_buf, strlen(ack_buf));
+    }
+
+    if (s == "HB:OFF") {
+        // Idle heartbeat from a target paused in default-mode OFF. We reconcile
+        // desired vs actual: if the dashboard wants ON but the target is still
+        // OFF, push AUTO_ON_RESET so it reboots into a fresh cycle. This is the
+        // path that makes OFF → ON work while the target is awake-but-idle, and
+        // also re-syncs the two nodes after either was physically reset (the
+        // transient pendingTargetCmd lives only in RAM and is lost on reset).
+        // Not logged to the dashboard — heartbeats would flood the event feed.
+        if (autoMode) {
+            const char* cmd = "CMD:AUTO_ON_RESET";
+            esp_now_send(mac, (const uint8_t*)cmd, strlen(cmd));
+        }
+        return;
     }
 
     if (s.startsWith("LOG:")) {
@@ -361,17 +416,65 @@ void handleRoot() {
 }
 
 void handleData() {
-    char buf[400];
+    char buf[420];
     snprintf(buf, sizeof(buf),
         "{\"I\":%.2f,\"I_ewma\":%.2f,\"V\":%.2f,\"T\":%.2f,\"turb\":%.1f"
-        ",\"mode\":\"%s\",\"locked\":%s"
+        ",\"mode\":\"%s\",\"locked\":%s,\"auto\":%s"
         ",\"th_stall\":%.2f,\"th_dry\":%.2f,\"th_thi\":%.2f,\"th_tlo\":%.2f"
         ",\"evt_seq\":%lu}",
         last_current, ewma_current, last_voltage, last_temp_c, last_turb,
         current_mode.c_str(),
         system_locked ? "true" : "false",
+        autoMode      ? "true" : "false",
         th_stall, th_dry_run, th_temp_high, th_temp_low,
         (unsigned long)evt_seq);
+    server.send(200, "application/json", buf);
+}
+
+// /mode?set=on  → enable default cycle  (and reset state if coming from OFF)
+// /mode?set=off → suspend default cycle (system goes to IDLE)
+// Response: {"auto":true|false}
+void handleMode() {
+    if (server.hasArg("set")) {
+        String v = server.arg("set"); v.toLowerCase();
+        bool requested = (v == "on" || v == "1" || v == "true");
+        bool was = autoMode;
+        autoMode = requested;
+        obsPrefs.putBool("auto", autoMode);
+
+        if (autoMode && !was) {
+            // OFF → ON transition: reset everything, start fresh.
+            // Observer-side state:
+            system_locked     = false;
+            is_calibrated     = false;
+            anomaly_reason    = "NONE";
+            current_mode      = "IDLE";
+            stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
+            ewma_init         = false;
+            grace_period      = 0;
+            // Tell the target to wipe its counters too (sent on next target msg)
+            pendingTargetCmd   = "CMD:AUTO_ON_RESET";
+            pendingTargetCount = 5;
+            push_event("phase", "Default mode ON — fresh cycle starting");
+            Serial.println("[OBS] Default mode → ON (RESET)");
+        } else if (!autoMode && was) {
+            // ON → OFF transition: pause the cycle, no reset of calibration.
+            // We DO reset current_mode and confirm counters so the dashboard
+            // pill reads "IDLE" (not stuck on MONITORING from the last cycle)
+            // and a stale stall_confirm counter doesn't fire when the user
+            // toggles back to ON.
+            current_mode  = "IDLE";
+            stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
+            ewma_init     = false;
+            pendingTargetCmd   = "CMD:AUTO_OFF";
+            pendingTargetCount = 5;
+            push_event("phase", "Default mode OFF — system paused");
+            Serial.println("[OBS] Default mode → OFF");
+        }
+        // No transition → no command needed
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf), "{\"auto\":%s}", autoMode ? "true" : "false");
     server.send(200, "application/json", buf);
 }
 
@@ -490,11 +593,17 @@ void setup() {
     server.on("/",            HTTP_GET, handleRoot);
     server.on("/data",        HTTP_GET, handleData);
     server.on("/events",      HTTP_GET, handleEvents);
+    server.on("/mode",        HTTP_GET, handleMode);   // dashboard toggle
     // Browsers automatically request /favicon.ico — registering an explicit
     // empty handler silences the WebServer "request handler not found" log.
     server.on("/favicon.ico", HTTP_GET, [](){ server.send(204, "text/plain", ""); });
     server.onNotFound([](){ server.send(204, "text/plain", ""); });
     server.begin();
+
+    // Load persistent default-mode toggle from NVS (defaults to ON first boot)
+    obsPrefs.begin("float-obs", false);
+    autoMode = obsPrefs.getBool("auto", true);
+    Serial.printf("[OBS] Default mode at boot: %s\n", autoMode ? "ON" : "OFF");
 
     push_event("phase", "IDLE — system online");
 

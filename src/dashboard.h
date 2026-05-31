@@ -46,7 +46,7 @@ header{display:flex;align-items:center;justify-content:space-between;flex-wrap:w
   background:linear-gradient(90deg,var(--accent),var(--teal));
   -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .bs{font-size:.7rem;color:var(--dim);margin-top:1px}
-.hr{display:flex;align-items:center;gap:8px}
+.hr{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .phase{padding:5px 13px;border-radius:99px;font-size:.72rem;font-weight:700;
   letter-spacing:.6px;border:1px solid var(--faint);color:var(--dim);transition:all .35s}
 .phase.LEARNING  {border-color:var(--teal);color:var(--teal)}
@@ -58,6 +58,24 @@ header{display:flex;align-items:center;justify-content:space-between;flex-wrap:w
 .dot.on {background:var(--ok);box-shadow:0 0 7px var(--ok)}
 .dot.err{background:var(--danger);box-shadow:0 0 7px var(--danger)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* Default mode toggle */
+.toggle-wrap{display:flex;align-items:center;gap:8px;padding:4px 11px;border-radius:99px;
+  border:1px solid var(--border);background:var(--card);font-size:.72rem;font-weight:600}
+.toggle-lbl{color:var(--dim);text-transform:uppercase;letter-spacing:.6px;font-size:.62rem}
+.toggle-state{font-weight:700;letter-spacing:.5px;min-width:24px;text-align:center;
+  transition:color .25s}
+.toggle-state.on {color:var(--ok)}
+.toggle-state.off{color:var(--dim)}
+.switch{position:relative;display:inline-block;width:34px;height:18px;cursor:pointer}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--faint);border-radius:18px;
+  transition:.3s}
+.slider::before{content:"";position:absolute;height:14px;width:14px;left:2px;top:2px;
+  background:#fff;border-radius:50%;transition:.3s}
+.switch input:checked + .slider{background:linear-gradient(90deg,var(--accent),var(--teal))}
+.switch input:checked + .slider::before{transform:translateX(16px)}
+.switch input:disabled + .slider{opacity:.5;cursor:not-allowed}
 
 /* Cards */
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
@@ -119,6 +137,14 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
       <div><div class="bn">FLOAT Aquarium</div><div class="bs">Monitor live — Observer</div></div>
     </div>
     <div class="hr">
+      <div class="toggle-wrap">
+        <span class="toggle-lbl">Default mode</span>
+        <label class="switch">
+          <input type="checkbox" id="tg-auto" checked onchange="setAutoMode(this.checked)">
+          <span class="slider"></span>
+        </label>
+        <span id="tg-state" class="toggle-state on">ON</span>
+      </div>
       <span id="phase" class="phase">IDLE</span>
       <div class="conn"><div id="dot" class="dot"></div><span id="conn">Connecting…</span></div>
     </div>
@@ -159,6 +185,7 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
 <script>
 const N=80;
 let cCur=null, thStall=null, thDry=null, lastEvtId=0, failing=0;
+let togglePending=false;   // ignore /data sync while a toggle is in flight
 
 function seq(){return Array(N).fill(null)}
 
@@ -209,8 +236,33 @@ async function pollData(){
     if(d.th_dry>0   && d.th_dry!==thDry)   {thDry=d.th_dry;     flat(3,thDry)}
     push(0,d.I); push(1,d.I_ewma);
     cCur.update('none');
+    // Keep the default-mode toggle in sync with the observer's NVS state
+    // (unless we're mid-toggle, to avoid bouncing while the request flies).
+    if(!togglePending && typeof d.auto === 'boolean') syncToggle(d.auto);
     setConn(true);
   }catch(e){ if(++failing>3) setConn(false); }
+}
+
+// User clicked the toggle in the UI.
+async function setAutoMode(on){
+  togglePending = true;
+  syncToggle(on);   // optimistic UI update
+  const tg = document.getElementById('tg-auto'); tg.disabled = true;
+  try{
+    await fetch('/mode?set=' + (on?'on':'off'));
+  }catch(_){ /* if the call fails, /data will eventually re-sync */ }
+  tg.disabled = false;
+  // Give the observer a moment to settle before re-syncing from /data
+  setTimeout(()=>{ togglePending = false; }, 1500);
+}
+
+// Reflect a boolean auto-mode state into the UI without firing onchange.
+function syncToggle(on){
+  const tg = document.getElementById('tg-auto');
+  if (tg.checked !== on) tg.checked = on;
+  const st = document.getElementById('tg-state');
+  st.textContent = on ? 'ON' : 'OFF';
+  st.className = 'toggle-state ' + (on ? 'on' : 'off');
 }
 
 async function pollEvents(){
