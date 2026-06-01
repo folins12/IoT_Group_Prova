@@ -49,6 +49,8 @@ Preferences   obsPrefs;
 bool          autoMode            = true;
 const char*   pendingTargetCmd    = nullptr;   // ESP-NOW string to forward
 int           pendingTargetCount  = 0;          // send N times for reliability
+bool          targetPumpOn        = false;     // last pump state from idle heartbeat
+bool          targetHalted        = false;     // last halt state from idle heartbeat
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int I2C_SDA     = 41;
@@ -66,6 +68,8 @@ uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
 String  current_mode   = "IDLE";    // IDLE | LEARNING | MONITORING
 bool    system_locked  = false;
 String  anomaly_reason = "NONE";
+String   last_anomaly_pushed = "NONE";  // de-duplicate dashboard toast events
+uint32_t last_anomaly_push_ms = 0;
 
 // ── Learning / calibration ─────────────────────────────────────────────────
 const int  MAX_SAMPLES = 60;
@@ -81,6 +85,10 @@ float th_stall           = 0.0f;   // stall threshold:   μ_I + 3σ_I
 float th_volt_min        = 0.0f;   // minimum healthy bus voltage (90 % of calib voltage)
 float th_dry_run         = 0.0f;   // dry-run threshold: 30 % of baseline mean current
 bool  is_calibrated      = false;
+bool  calFromManual      = false;   // true if current calibration came from a
+                                    // manual Calibrate (OFF mode). Decides whether
+                                    // OFF→ON keeps the baseline (boot 1) or relearns
+                                    // (boot 0), and survives only until ON→OFF.
 bool  new_temp_for_learn = false;  // set by DATA:SENSOR callback to trigger a combined I+V+T print
 
 // ── Dynamic temperature thresholds ────────────────────────────────────────
@@ -246,15 +254,24 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         esp_now_send(mac, (const uint8_t*)ack_buf, strlen(ack_buf));
     }
 
-    if (s == "HB:OFF") {
-        // Idle heartbeat from a target paused in default-mode OFF. We reconcile
-        // desired vs actual: if the dashboard wants ON but the target is still
-        // OFF, push AUTO_ON_RESET so it reboots into a fresh cycle. This is the
-        // path that makes OFF → ON work while the target is awake-but-idle, and
-        // also re-syncs the two nodes after either was physically reset (the
-        // transient pendingTargetCmd lives only in RAM and is lost on reset).
-        // Not logged to the dashboard — heartbeats would flood the event feed.
-        if (autoMode) {
+    if (s.startsWith("HB:")) {
+        // Idle heartbeat from a target paused in default-mode OFF. Payload is
+        // two digits "<pump><halt>": pump state then halt state ("HB:00" idle,
+        // "HB:10" pumping, "HB:01" halted). Three jobs:
+        //  1) reconcile desired vs actual — if the dashboard wants ON but the
+        //     target is still OFF, push AUTO_ON_RESET so it reboots into a
+        //     fresh cycle (makes OFF→ON work while idle, and re-syncs after a
+        //     physical reset when the transient pendingTargetCmd was lost);
+        //  2) record pump state so /data lights the dashboard pump control;
+        //  3) record target-side halt so the dashboard can show "Clear HALT"
+        //     even when this Observer was reset and lost its own lock.
+        targetPumpOn   = (s.length() > 3 && s.charAt(3) == '1');
+        targetHalted   = (s.length() > 4 && s.charAt(4) == '1');
+        if (autoMode && !targetHalted) {
+            // Bring the idle target online with a fresh learning cycle
+            // (AUTO_ON_RESET → boot 0). Skipped while the target is halted: it
+            // stays awake to be recovered with Clear HALT and must not be
+            // restarted out from under the halt.
             const char* cmd = "CMD:AUTO_ON_RESET";
             esp_now_send(mac, (const uint8_t*)cmd, strlen(cmd));
         }
@@ -292,6 +309,10 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         ewma_init            = false;
         new_temp_for_learn   = false;
         memset(temp_samples, 0, sizeof(temp_samples));
+        // Remember who triggered this learn: a manual Calibrate (autoMode=false)
+        // produces a baseline that should survive the next OFF→ON; the automatic
+        // first-boot learn (autoMode=true) does not.
+        calFromManual        = !autoMode;
         Serial.println("[OBS] MODE → LEARNING");
         push_event("phase", "LEARNING — calibrating pump baseline");
 
@@ -416,19 +437,82 @@ void handleRoot() {
 }
 
 void handleData() {
-    char buf[420];
+    char buf[460];
     snprintf(buf, sizeof(buf),
         "{\"I\":%.2f,\"I_ewma\":%.2f,\"V\":%.2f,\"T\":%.2f,\"turb\":%.1f"
-        ",\"mode\":\"%s\",\"locked\":%s,\"auto\":%s"
+        ",\"mode\":\"%s\",\"locked\":%s,\"auto\":%s,\"pump\":%s,\"thalt\":%s"
         ",\"th_stall\":%.2f,\"th_dry\":%.2f,\"th_thi\":%.2f,\"th_tlo\":%.2f"
         ",\"evt_seq\":%lu}",
         last_current, ewma_current, last_voltage, last_temp_c, last_turb,
         current_mode.c_str(),
         system_locked ? "true" : "false",
         autoMode      ? "true" : "false",
+        targetPumpOn  ? "true" : "false",
+        targetHalted  ? "true" : "false",
         th_stall, th_dry_run, th_temp_high, th_temp_low,
         (unsigned long)evt_seq);
     server.send(200, "application/json", buf);
+}
+
+// Manual controls — only valid while default mode is OFF (system idle). The
+// target is awake in its idle loop and is a registered ESP-NOW peer, so we
+// send straight to it, repeated a few times for reliability like the HALT echo.
+//   /cmd?a=pump_on&sec=N   (N=0 or absent → infinite)
+//   /cmd?a=pump_off
+//   /cmd?a=feed&sec=N      (N=0 or absent → one-shot; N>0 → repeat every N s)
+//   /cmd?a=calibrate
+void handleCmd() {
+    String a   = server.hasArg("a")   ? server.arg("a")          : "";
+    // Clear HALT must work in BOTH modes so an automatic-mode halt is
+    // recoverable from the dashboard, exactly like a manual-mode halt. Every
+    // other manual control is disabled while the automatic cycle owns the pump.
+    if (autoMode && a != "clear_halt") {
+        server.send(409, "application/json", "{\"err\":\"auto mode on\"}");
+        return;
+    }
+    long   sec = server.hasArg("sec") ? server.arg("sec").toInt() : 0;
+    if (sec < 0) sec = 0;
+
+    char cmd[40];
+    bool known = true;
+    if (a == "pump_on") {
+        snprintf(cmd, sizeof(cmd), "CMD:PUMP_ON:%ld", sec);
+        targetPumpOn = true;
+        push_event("phase", sec > 0 ? "Manual pump ON (timed)" : "Manual pump ON");
+    } else if (a == "pump_off") {
+        snprintf(cmd, sizeof(cmd), "CMD:PUMP_OFF");
+        targetPumpOn = false;
+        push_event("phase", "Manual pump OFF");
+    } else if (a == "feed") {
+        snprintf(cmd, sizeof(cmd), "CMD:FEED:%ld", sec);
+        push_event("phase", sec > 0 ? "Manual feed scheduled" : "Manual feed (once)");
+    } else if (a == "calibrate") {
+        snprintf(cmd, sizeof(cmd), "CMD:CALIBRATE");
+        push_event("phase", "Manual calibration requested");
+    } else if (a == "clear_halt") {
+        // Recovery from a halt, valid in both modes: unlock the Observer and
+        // tell the target to clear its latch. In auto mode the target reboots
+        // into a fresh cycle; in manual mode it returns to idle.
+        snprintf(cmd, sizeof(cmd), "CMD:CLEAR_HALT");
+        system_locked = false;
+        anomaly_reason = "NONE";
+        last_anomaly_pushed = "NONE";
+        current_mode   = "IDLE";
+        stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
+        targetPumpOn  = false;
+        targetHalted  = false;
+        push_event("phase", "HALT cleared by user");
+    } else {
+        known = false;
+    }
+
+    if (!known) { server.send(400, "application/json", "{\"err\":\"bad action\"}"); return; }
+
+    for (int i = 0; i < 5; i++) { espNowSend(cmd); delay(8); }
+
+    char resp[48];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"pump\":%s}", targetPumpOn ? "true" : "false");
+    server.send(200, "application/json", resp);
 }
 
 // /mode?set=on  → enable default cycle  (and reset state if coming from OFF)
@@ -443,33 +527,42 @@ void handleMode() {
         obsPrefs.putBool("auto", autoMode);
 
         if (autoMode && !was) {
-            // OFF → ON transition: reset everything, start fresh.
-            // Observer-side state:
+            // OFF → ON transition: ALWAYS start a fresh learning cycle. Any
+            // previous calibration (manual or automatic) is discarded so the
+            // baseline always matches the current setup. Target relearns at
+            // boot 0; the dashboard threshold lines are cleared until the new
+            // calibration completes.
             system_locked     = false;
-            is_calibrated     = false;
             anomaly_reason    = "NONE";
+            last_anomaly_pushed = "NONE";
             current_mode      = "IDLE";
             stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
             ewma_init         = false;
             grace_period      = 0;
-            // Tell the target to wipe its counters too (sent on next target msg)
+            targetPumpOn      = false;   // manual pump state wiped on reset
+            is_calibrated     = false;
+            calFromManual     = false;
+            th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;  // clear chart lines
             pendingTargetCmd   = "CMD:AUTO_ON_RESET";
             pendingTargetCount = 5;
-            push_event("phase", "Default mode ON — fresh cycle starting");
-            Serial.println("[OBS] Default mode → ON (RESET)");
+            push_event("phase", "Default mode ON — fresh learning starting");
+            Serial.println("[OBS] Default mode → ON (fresh learning)");
         } else if (!autoMode && was) {
-            // ON → OFF transition: pause the cycle, no reset of calibration.
-            // We DO reset current_mode and confirm counters so the dashboard
-            // pill reads "IDLE" (not stuck on MONITORING from the last cycle)
-            // and a stale stall_confirm counter doesn't fire when the user
-            // toggles back to ON.
+            // ON → OFF transition: pause the cycle and DISCARD any calibration.
+            // The user re-calibrates manually in OFF (or it relearns on next ON).
             current_mode  = "IDLE";
             stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
             ewma_init     = false;
+            targetPumpOn  = false;   // target enters idle with pump off
+            is_calibrated = false;   // wipe calibration
+            calFromManual = false;
+            anomaly_reason = "NONE";
+            last_anomaly_pushed = "NONE";
+            th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;   // clear chart lines
             pendingTargetCmd   = "CMD:AUTO_OFF";
             pendingTargetCount = 5;
-            push_event("phase", "Default mode OFF — system paused");
-            Serial.println("[OBS] Default mode → OFF");
+            push_event("phase", "Default mode OFF — system paused, calibration cleared");
+            Serial.println("[OBS] Default mode → OFF (calibration cleared)");
         }
         // No transition → no command needed
     }
@@ -594,6 +687,7 @@ void setup() {
     server.on("/data",        HTTP_GET, handleData);
     server.on("/events",      HTTP_GET, handleEvents);
     server.on("/mode",        HTTP_GET, handleMode);   // dashboard toggle
+    server.on("/cmd",         HTTP_GET, handleCmd);    // manual controls (OFF only)
     // Browsers automatically request /favicon.ico — registering an explicit
     // empty handler silences the WebServer "request handler not found" log.
     server.on("/favicon.ico", HTTP_GET, [](){ server.send(204, "text/plain", ""); });
@@ -726,6 +820,19 @@ void loop() {
                           ewma_current, last_voltage, last_temp_c,
                           th_temp_high, th_temp_low);
 
+            // Dashboard pop-up: push a typed event the UI turns into a toast.
+            // "halt" = red (stops the pump), "warn" = orange (advisory only).
+            // Throttled so a persistent temp/voltage condition doesn't spam:
+            // re-push only when the reason changes or after 15 s.
+            bool isHalt = (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN");
+            uint32_t nowm = (uint32_t)millis();
+            if (anomaly_reason != last_anomaly_pushed ||
+                (nowm - last_anomaly_push_ms) > 15000) {
+                push_event(isHalt ? "halt" : "warn", anomaly_reason.c_str());
+                last_anomaly_pushed  = anomaly_reason;
+                last_anomaly_push_ms = nowm;
+            }
+
             // MOTOR_STALL and DRY_RUN halt the system immediately — pump must stop.
             // VOLTAGE_DROP, TEMP_TOO_HIGH, TEMP_TOO_LOW are warnings:
             //   buzzer alerts the operator but the pump keeps running, because:
@@ -736,6 +843,7 @@ void loop() {
             if (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN") {
                 for (int i = 0; i < 10; i++) { espNowSend("HALT"); delay(5); }
                 system_locked = true;
+                targetHalted  = true;
             }
 
             char alert[64];

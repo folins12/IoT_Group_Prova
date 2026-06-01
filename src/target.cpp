@@ -24,6 +24,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "soc/soc.h"
@@ -38,6 +39,20 @@ bool autoCycleEnabled = true;   // mirrored in NVS as "auto"
 volatile bool restart_requested = false;   // set by AUTO_ON_RESET in callback;
                                             // ESP.restart() is performed outside
                                             // the callback (in loop() / end-of-cycle).
+
+// ── Manual controls (default-mode OFF only; all RAM, never persisted) ───────
+// These exist only while the system is paused in idle. They are wiped whenever
+// the user switches back to default-mode ON (the AUTO_ON_RESET handler clears
+// them and reboots), and they do NOT survive a power cycle. This makes manual
+// mode a maintenance/test bench, not a second persistent operating mode.
+volatile bool          manualPumpOn       = false;  // pump currently driven by user
+volatile unsigned long manualPumpOffAt    = 0;      // millis() deadline; 0 = infinite
+volatile bool          manualFeedNow      = false;  // do one servo feed asap
+volatile unsigned long feedIntervalMs     = 0;      // 0 = one-shot (no repeat)
+volatile unsigned long nextFeedAt         = 0;      // millis() of next scheduled feed
+volatile bool          manualCalibrateReq = false;  // run a learning sample from idle
+float                  lastTurbidityNtu   = -1.0f;   // last turbidity, cached for
+                                                     // loop()/manual calibration use
 
 // ── Pin map ────────────────────────────────────────────────────────────────
 const int PUMP_PIN      = 47;
@@ -93,7 +108,33 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         emergency_stop = true;
         system_halted  = true;
         anomaly_count++;
+        manualPumpOn    = false;   // manual run aborted by the halt
+        manualPumpOffAt = 0;
         prefs.putBool("halted", true);   // persist across power loss
+    } else if (s == "CMD:CLEAR_HALT") {
+        // Recovery from a halt (dashboard "Clear HALT" button). Clears the latch.
+        // In manual mode we return to a clean idle state (pump off; the user
+        // re-enables it). In automatic mode we reboot into a fresh cycle, just
+        // like AUTO_ON_RESET, so the system resumes unattended operation.
+        system_halted   = false;
+        emergency_stop  = false;
+        anomaly_count   = 0;
+        manualPumpOn    = false;
+        manualPumpOffAt = 0;
+        manualFeedNow   = false;
+        feedIntervalMs  = 0;
+        nextFeedAt      = 0;
+        digitalWrite(PUMP_PIN, LOW);
+        prefs.putBool("halted", false);
+        prefs.putInt("storm", 0);
+        if (autoCycleEnabled) {
+            bootCount         = 0;          // fresh learning cycle after recovery
+            consecutive_noack = 0;
+            restart_requested = true;
+            Serial.println("[TGT] HALT cleared by user — restarting fresh (auto)");
+        } else {
+            Serial.println("[TGT] HALT cleared by user — back to idle (manual)");
+        }
     } else if (s == "CMD:AUTO_OFF") {
         // Dashboard toggle moved to OFF → stop the default cycle.
         // Effect takes hold from the NEXT wake (current action completes).
@@ -102,6 +143,37 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             prefs.putBool("auto", false);
             Serial.println("[TGT] Default mode → OFF (system will idle next wake)");
         }
+    } else if (s == "CMD:PUMP_ON") {
+        // Manual pump ON, infinite (no duration given). Ignored while halted.
+        if (!system_halted) {
+            manualPumpOn    = true;
+            manualPumpOffAt = 0;
+            digitalWrite(PUMP_PIN, HIGH);
+        }
+    } else if (s.startsWith("CMD:PUMP_ON:")) {
+        // Manual pump ON with a duration in seconds (0 = infinite).
+        if (!system_halted) {
+            long sec = s.substring(12).toInt();
+            manualPumpOn    = true;
+            manualPumpOffAt = (sec > 0) ? (millis() + (unsigned long)sec * 1000UL) : 0;
+            digitalWrite(PUMP_PIN, HIGH);
+        }
+    } else if (s == "CMD:PUMP_OFF") {
+        manualPumpOn    = false;
+        manualPumpOffAt = 0;
+        digitalWrite(PUMP_PIN, LOW);
+    } else if (s.startsWith("CMD:FEED")) {
+        // CMD:FEED  or  CMD:FEED:N  (N = repeat interval in seconds, 0/absent = once)
+        long sec = 0;
+        int  c   = s.indexOf(':', 4);       // second colon, if any
+        if (c != -1) sec = s.substring(c + 1).toInt();
+        feedIntervalMs = (sec > 0) ? (unsigned long)sec * 1000UL : 0;
+        manualFeedNow  = true;              // first feed happens immediately in loop()
+    } else if (s == "CMD:CALIBRATE") {
+        // Run a manual learning sample. The actual work is done in loop()
+        // (too long for the receive callback). Pump is left in whatever state
+        // the user set — we deliberately don't force it on or off.
+        manualCalibrateReq = true;
     } else if (s == "CMD:AUTO_ON") {
         // Dashboard toggle confirmed ON. No state reset — just remember.
         if (!autoCycleEnabled) {
@@ -116,20 +188,58 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         // RTC_DATA_ATTR (bootCount) survives ESP.restart() but not POWERON, so
         // after the restart setup() runs again with bootCount = 0 → learning.
         //
-        // We CANNOT use bootCount = -1 (relying on goToSleep to increment to 0)
-        // because the handler may run mid-setup, before main logic checks
-        // bootCount. With bootCount = -1 in setup, main logic would fall through
-        // to the `else` branch (pump cycle, no learning) — exactly the bug we
-        // saw in the previous run when the toggle ON triggered a stall.
-        autoCycleEnabled  = true;
-        bootCount         = 0;
-        system_halted     = false;
-        anomaly_count     = 0;
-        consecutive_noack = 0;
-        prefs.putBool("auto",   true);
-        prefs.putBool("halted", false);
-        restart_requested = true;
-        Serial.println("[TGT] Default mode → ON + RESET (restart pending)");
+        // Guard: only act while we're still in manual mode (autoCycleEnabled
+        // false) and no restart is already pending. The Observer sends this
+        // several times for reliability and re-echoes it on every heartbeat;
+        // without the guard each copy that lands during boot would re-trigger a
+        // restart, producing the BOOT#1→BOOT#0 loop seen in the logs.
+        if (!autoCycleEnabled && !restart_requested) {
+            autoCycleEnabled  = true;
+            bootCount         = 0;
+            system_halted     = false;
+            anomaly_count     = 0;
+            consecutive_noack = 0;
+            // Wipe any manual controls — switching to ON always starts clean.
+            manualPumpOn       = false;
+            manualPumpOffAt    = 0;
+            manualFeedNow      = false;
+            feedIntervalMs     = 0;
+            nextFeedAt         = 0;
+            manualCalibrateReq = false;
+            digitalWrite(PUMP_PIN,  LOW);
+            digitalWrite(SERVO_PIN, LOW);
+            prefs.putBool("auto",   true);
+            prefs.putBool("halted", false);
+            prefs.putInt("storm", 0);
+            restart_requested = true;
+            Serial.println("[TGT] Default mode → ON + RESET (restart pending)");
+        }
+    } else if (s == "CMD:AUTO_ON_KEEP") {
+        // Dashboard toggle OFF → ON *with a manual calibration already done*.
+        // Keep the Observer's thresholds (it doesn't reset them) and skip the
+        // learning phase by starting at bootCount = 1, so the target goes
+        // straight into the monitored pump cycle using the user's baseline.
+        // Same duplicate-restart guard as AUTO_ON_RESET.
+        if (!autoCycleEnabled && !restart_requested) {
+            autoCycleEnabled  = true;
+            bootCount         = 1;          // 1 = skip learning, run monitored cycle
+            system_halted     = false;
+            anomaly_count     = 0;
+            consecutive_noack = 0;
+            manualPumpOn       = false;
+            manualPumpOffAt    = 0;
+            manualFeedNow      = false;
+            feedIntervalMs     = 0;
+            nextFeedAt         = 0;
+            manualCalibrateReq = false;
+            digitalWrite(PUMP_PIN,  LOW);
+            digitalWrite(SERVO_PIN, LOW);
+            prefs.putBool("auto",   true);
+            prefs.putBool("halted", false);
+            prefs.putInt("storm", 0);
+            restart_requested = true;
+            Serial.println("[TGT] Default mode → ON, keeping manual calibration (boot 1)");
+        }
     } else if (s.startsWith("ACK:")) {
         acked_id     = (uint32_t)s.substring(4).toInt();
         ack_received = true;
@@ -342,6 +452,37 @@ void setup() {
     if (!system_halted) system_halted = prefs.getBool("halted", false);
     autoCycleEnabled = prefs.getBool("auto", true);
 
+    // ── Fresh-power-on halt handling ──────────────────────────────────────
+    // The NVS "halted" latch protects against re-running the pump after a
+    // stall, even across a power loss. But a deliberate power-on must be able
+    // to start fresh (the user expects a new learning cycle); otherwise a
+    // stale latch from a previous test session blocks startup forever — which
+    // is exactly the "learning never starts" symptom in the logs.
+    //
+    // We can't tell a clean power-on from a stall-induced brownout by reset
+    // reason alone (both wipe RTC and report POWERON with brown-out disabled).
+    // So we keep an NVS "storm" counter: every RTC-wiping reset bumps it; a
+    // clean monitored cycle (or a dashboard Clear HALT / mode reset) clears it.
+    //  - storm ≤ 3: treat as a genuine (re)start — clear any stale halt latch so
+    //    the system learns/runs fresh instead of being stuck from a prior session.
+    //  - storm > 3: the device keeps resetting without ever finishing a clean
+    //    cycle — typically a pump stall that browns out the supply, looping the
+    //    learning phase forever. Force a halt (and stay awake, handled below) so
+    //    the dashboard shows HALTED and the user can fix the pump + Clear HALT.
+    if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {   // RTC wiped: power-on / brownout / SW reset
+        int storm = prefs.getInt("storm", 0) + 1;
+        prefs.putInt("storm", storm);
+        if (storm > 3) {
+            system_halted = true;
+            prefs.putBool("halted", true);
+            Serial.printf("[TGT] Reset storm=%d — fault loop suspected, halting for safety\n", storm);
+        } else if (system_halted) {
+            system_halted = false;
+            prefs.putBool("halted", false);
+            Serial.printf("[TGT] Power-on (storm=%d) — cleared stale halt, starting fresh\n", storm);
+        }
+    }
+
     // ── DS18B20 reading (before WiFi to avoid losing conversion window) ───
     tempSensor.begin();
     tempSensor.setResolution(11);
@@ -359,6 +500,7 @@ void setup() {
     //      blocking the ESP-NOW link (which hasn't been created yet).
     float turbidity_ntu = readTurbidityFromArduino(water_temp);
     int   turbidity_pct = (int)((turbidity_ntu / TURB_MAX_NTU) * 100.0f);
+    lastTurbidityNtu    = turbidity_ntu;   // cache for loop()/manual calibration
 
     // ── WiFi + ESP-NOW init ───────────────────────────────────────────────
     WiFi.mode(WIFI_STA);
@@ -422,17 +564,8 @@ void setup() {
 
     // ── Decision after grace window ───────────────────────────────────────
 
-    // Halted (either from NVS at boot OR set by a HALT just received above).
-    // Note: AUTO_ON_RESET (handled in callback) clears system_halted, so the
-    // user can recover from HALT by toggling the dashboard OFF → ON.
-    if (system_halted) {
-        sendMsg("LOG", "[HALT] Target halted — back to deep sleep. "
-                       "Toggle Default mode OFF/ON from the dashboard to recover.");
-        goToSleep();
-    }
-
-    // A restart was requested by AUTO_ON_RESET — perform it cleanly here,
-    // before doing any cycle work that would be wasted by an imminent reboot.
+    // A restart was requested by AUTO_ON_RESET / AUTO_ON_KEEP — perform it
+    // cleanly here, before doing any cycle work that an imminent reboot wastes.
     if (restart_requested) {
         Serial.println("[TGT] Restart requested — rebooting for fresh state");
         Serial.flush();
@@ -440,10 +573,24 @@ void setup() {
         ESP.restart();
     }
 
-    // Default mode OFF: do NOT deep-sleep. Return from setup() so loop() takes
-    // over and the device stays awake indefinitely, listening on ESP-NOW for
-    // an AUTO_ON_RESET to come back online. This is the "stay in IDLE forever"
-    // behavior the user asked for — no periodic boots while paused.
+    // Default mode OFF (manual): do NOT deep-sleep. Return from setup() so
+    // loop() takes over and the device stays awake on ESP-NOW. This holds even
+    // when halted: in manual mode a HALT must leave the device awake so the
+    // user can press "Clear HALT" on the dashboard (in automatic mode, by
+    // contrast, a halt sleeps and is recovered via the OFF/ON toggle below).
+    // A HALT keeps the device AWAKE in BOTH modes (it does not deep-sleep), so
+    // the dashboard shows HALTED and the "Clear HALT" button can reach the
+    // target over ESP-NOW. This makes automatic-mode HALT behave exactly like
+    // manual-mode HALT. Recovery via Clear HALT: in auto mode it reboots into a
+    // fresh cycle, in manual mode it returns to idle (handled in CMD:CLEAR_HALT).
+    if (system_halted) {
+        sendMsg("LOG", "[HALT] Halted — pump locked. "
+                       "Press 'Clear HALT' on the dashboard to recover.");
+        return;
+    }
+
+    // Default mode OFF (manual) and NOT halted: stay awake so loop() can service
+    // the manual controls and heartbeat. Automatic mode falls through to the cycle.
     if (!autoCycleEnabled) {
         sendMsg("LOG", "[IDLE] Default mode OFF — staying awake, no boots until toggled ON");
         return;
@@ -570,8 +717,18 @@ void setup() {
     delay(500);
     if (!emergency_stop && !system_halted) {
         prefs.putBool("halted", false);
+        prefs.putInt("storm", 0);   // a clean cycle proves we're not in a stall loop
     } else {
         sendMsg("LOG", "[LATCH] Anomaly detected during cycle — halted state persisted");
+    }
+
+    // Halted by an anomaly during this cycle: stay AWAKE (don't deep-sleep) so
+    // the dashboard shows HALTED and Clear HALT can reach us — same as manual
+    // mode. loop() takes over and keeps sending heartbeats.
+    if (system_halted) {
+        sendMsg("LOG", "[HALT] Halted — pump locked. "
+                       "Press 'Clear HALT' on the dashboard to recover.");
+        return;
     }
 
     // AUTO_OFF received mid-cycle: stay awake instead of sleeping. loop() will
@@ -593,13 +750,53 @@ void setup() {
     goToSleep();
 }
 
+// ── doFeed – one servo open/close to drop food ───────────────────────────────
+// Same motion the automatic clean-water branch uses. Safe to call from loop().
+void doFeed() {
+    sendMsg("LOG", "[MANUAL] Feed — servo open 90°");
+    servoMove(1500, 35);   // open
+    delay(500);
+    servoMove(1000, 35);   // close
+    sendMsg("LOG", "[MANUAL] Feed — servo closed");
+}
+
+// ── runManualCalibration – learn a baseline from the CURRENT pump state ──────
+// Triggered by the dashboard "Calibrate" button while idle. Deliberately does
+// NOT touch the pump: it samples whatever the user has set up. If the pump is
+// off the baseline will be the idle current (~13 mA) and the resulting stall
+// threshold will be far too low — that's the user's responsibility, and the
+// dashboard warns about it. Reuses the Observer's existing LEARNING machinery:
+// START_LEARN → stream temp/turb for 10 s → STOP_MEASURE → Observer computes
+// EWMA+Hampel thresholds exactly as in the automatic first-boot calibration.
+void runManualCalibration() {
+    sendMsg("LOG", String("[MANUAL] Calibration start (pump ") +
+            (manualPumpOn ? "ON" : "OFF — baseline will be idle, thresholds invalid!") + ")");
+
+    bool ok = sendMsgWithACK("CMD", "START_LEARN");
+    if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_LEARN");
+    delay(300);
+
+    unsigned long t0          = millis();
+    unsigned long last_update = millis();
+    while (millis() - t0 < 10000) {
+        if (millis() - last_update >= 300) {
+            last_update = millis();
+            tempSensor.requestTemperatures();
+            float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
+            float live_turb = lastTurbidityNtu;
+            sendMsg("DATA", "SENSOR:" + String(live_turb, 1) + "," + String(live_temp, 1));
+        }
+        delay(10);
+    }
+    sendMsgWithACK("CMD", "STOP_MEASURE");
+    sendMsg("LOG", "[MANUAL] Calibration done — thresholds updated on Observer");
+}
+
 // ── loop ───────────────────────────────────────────────────────────────────
-// In normal default-mode ON, setup() ends with goToSleep() and loop() is never
-// reached. In default-mode OFF, setup() returns early so loop() runs forever
-// — the device stays awake on ESP-NOW, waiting for an AUTO_ON_RESET to come
-// back online. When that arrives (in the receive callback), it sets
-// restart_requested = true; we pick it up here and do a clean ESP.restart()
-// to begin a fresh cycle with bootCount = 0 → learning.
+// Reached only in default-mode OFF (setup() returns early). The device stays
+// awake on ESP-NOW. This is the manual / maintenance bench: it services the
+// pump duration timer, the food scheduler and calibration requests, and pings
+// the Observer with its pump state so OFF→ON reconciliation keeps working.
 void loop() {
     if (restart_requested) {
         Serial.println("[TGT] Restart requested — rebooting for fresh state");
@@ -607,19 +804,69 @@ void loop() {
         delay(100);
         ESP.restart();
     }
-    // In default-mode OFF the target stays awake; it cannot wake-and-poll like
-    // it does between cycles. The Observer only ever sends to us in RESPONSE to
-    // one of our messages (piggy-back), so a silent target can never be told to
-    // come back ON. We therefore ping the Observer every 2 s with our current
-    // state ("HB:OFF"). The Observer reconciles: if the dashboard wants ON but
-    // we report OFF, it pushes CMD:AUTO_ON_RESET and we reboot into a fresh
-    // cycle. Reporting our state (rather than a bare ping) is what makes OFF→ON
-    // work even after either node has been physically reset and the transient
-    // pendingTargetCmd has been lost.
-    static unsigned long last_hb = 0;
-    if (millis() - last_hb >= 2000) {
-        last_hb = millis();
-        sendMsg("HB", "OFF");
+
+    unsigned long now = millis();
+
+    // ── Manual pump monitoring ────────────────────────────────────────────
+    // While the user runs the pump manually we put the Observer in MONITORING
+    // so its stall / dry-run detection (and HALT) stay active exactly as in the
+    // automatic cycle. The Observer samples current on its own timer; we just
+    // tell it when to start/stop and stream temp/turbidity for its temp alarms
+    // and the dashboard. NOTE: the Observer only detects current anomalies when
+    // calibrated, so manual HALT requires a prior calibration with the pump on.
+    static bool monitorActive = false;
+    static unsigned long last_stream = 0;
+    if (manualPumpOn && !monitorActive) {
+        sendMsgWithACK("CMD", "START_MONITOR");
+        monitorActive = true;
+    } else if (!manualPumpOn && monitorActive) {
+        sendMsgWithACK("CMD", "STOP_MEASURE");
+        monitorActive = false;
     }
-    delay(100);
+    if (manualPumpOn && (now - last_stream >= 300)) {
+        last_stream = now;
+        tempSensor.requestTemperatures();
+        float t = safeTemp(tempSensor.getTempCByIndex(0));
+        sendMsg("DATA", "SENSOR:" + String(lastTurbidityNtu, 1) + "," + String(t, 1));
+    }
+
+    // Manual pump timed auto-off (signed compare handles millis() wrap).
+    if (manualPumpOn && manualPumpOffAt != 0 && (long)(now - manualPumpOffAt) >= 0) {
+        manualPumpOn    = false;
+        manualPumpOffAt = 0;
+        digitalWrite(PUMP_PIN, LOW);
+        sendMsg("LOG", "[MANUAL] Pump duration elapsed — OFF");
+    }
+
+    // Manual calibration request (long-running; runs outside the RX callback).
+    if (manualCalibrateReq) {
+        manualCalibrateReq = false;
+        runManualCalibration();
+        monitorActive = false;   // calibration left Observer in IDLE; if the
+                                 // pump is still on, re-arm MONITORING next pass
+    }
+
+    // Food: first feed immediately, then repeat at the chosen interval (if any).
+    if (manualFeedNow) {
+        manualFeedNow = false;
+        doFeed();
+        nextFeedAt = (feedIntervalMs > 0) ? (now + feedIntervalMs) : 0;
+    } else if (nextFeedAt != 0 && (long)(now - nextFeedAt) >= 0) {
+        doFeed();
+        nextFeedAt = millis() + feedIntervalMs;   // re-read millis(): doFeed() blocks ~1.6s
+    }
+
+    // Heartbeat every 2 s, reporting pump + halt state as two digits:
+    // "HB:<pump><halt>" e.g. "HB:00" idle, "HB:10" pumping, "HB:01" halted.
+    // Lets the Observer reconcile OFF→ON, light the dashboard pump control,
+    // and — crucially — surface a target-side halt even when the Observer
+    // itself was reset and lost its own lock, so "Clear HALT" stays reachable.
+    static unsigned long last_hb = 0;
+    if (now - last_hb >= 2000) {
+        last_hb = now;
+        String hb = String(manualPumpOn ? "1" : "0") + String(system_halted ? "1" : "0");
+        sendMsg("HB", hb);
+    }
+
+    delay(50);
 }

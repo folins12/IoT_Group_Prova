@@ -77,6 +77,35 @@ header{display:flex;align-items:center;justify-content:space-between;flex-wrap:w
 .switch input:checked + .slider::before{transform:translateX(16px)}
 .switch input:disabled + .slider{opacity:.5;cursor:not-allowed}
 
+/* Manual controls (enabled only when default mode is OFF) */
+.manual{background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+  padding:16px;box-shadow:var(--sh);transition:opacity .3s}
+.manual.locked{opacity:.45;pointer-events:none}
+.manual-t{font-size:.7rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+  color:var(--dim);margin-bottom:4px}
+.manual-sub{font-size:.66rem;color:var(--faint);margin-bottom:14px}
+.mrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:11px 0;border-top:1px solid var(--border)}
+.mrow:first-of-type{border-top:none}
+.mbtn{appearance:none;border:1px solid var(--faint);background:var(--surface);
+  color:var(--txt);font-size:.8rem;font-weight:700;letter-spacing:.4px;
+  padding:9px 16px;border-radius:9px;cursor:pointer;transition:all .2s;min-width:128px}
+.mbtn:hover:not(:disabled){border-color:var(--accent);box-shadow:0 0 12px rgba(56,178,255,.25)}
+.mbtn:disabled{opacity:.5;cursor:not-allowed}
+.mbtn.on{background:linear-gradient(90deg,var(--accent),var(--teal));border-color:transparent;color:#021019}
+.mbtn.warn{border-color:var(--warn);color:var(--warn)}
+.mfields{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.mfields input{width:64px;background:var(--deep);border:1px solid var(--faint);
+  color:var(--txt);border-radius:7px;padding:7px 9px;font-size:.8rem;
+  font-variant-numeric:tabular-nums}
+.mfields select{background:var(--deep);border:1px solid var(--faint);color:var(--txt);
+  border-radius:7px;padding:7px 6px;font-size:.78rem}
+.mfields input:disabled,.mfields select:disabled{opacity:.5}
+.mhint{font-size:.64rem;color:var(--faint);flex:1;min-width:120px;line-height:1.35}
+.mwarn{font-size:.64rem;color:var(--warn);flex-basis:100%;line-height:1.35;
+  display:none}
+.mwarn.show{display:block}
+
 /* Cards */
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 @media(max-width:560px){.cards{grid-template-columns:1fr}}
@@ -125,9 +154,20 @@ canvas{display:block;width:100%!important;height:260px!important}
 #lost{display:none;position:fixed;top:0;left:0;right:0;z-index:99;padding:9px;
   text-align:center;background:var(--danger);color:#fff;font-weight:700;font-size:.83rem}
 footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
+#toasts{position:fixed;top:14px;right:14px;z-index:1000;display:flex;flex-direction:column;gap:8px;max-width:300px}
+.toast{padding:11px 13px;border-radius:10px;border-left:4px solid;background:#1b2130;color:#e8edf6;
+  box-shadow:0 6px 20px rgba(0,0,0,.45);font-size:13px;line-height:1.35;cursor:pointer;
+  animation:tin .22s ease-out;display:flex;gap:9px;align-items:flex-start}
+.toast .ti{font-size:16px;line-height:1.1}
+.toast .tt{font-weight:700;display:block;margin-bottom:1px}
+.toast.halt{border-left-color:#ff4d6a;background:#2a1a20}
+.toast.warn{border-left-color:#f5a623;background:#2a2418}
+.toast.fade{opacity:0;transform:translateX(12px);transition:all .35s ease}
+@keyframes tin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
 </style>
 </head>
 <body>
+<div id="toasts"></div>
 <div id="lost">⚠ Connessione persa — riprovo…</div>
 <div class="app">
 
@@ -159,6 +199,52 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
       <div id="v-turb" class="cv t-pur">—</div><div class="cu">NTU</div></div>
   </div>
 
+  <div id="manual" class="manual locked">
+    <div class="manual-t">Manual controls</div>
+    <div class="manual-sub">Available only while Default mode is OFF. All settings are temporary and are wiped when you switch back to ON.</div>
+
+    <div class="mrow">
+      <button id="btn-pump" class="mbtn" onclick="togglePump()">Pump: OFF</button>
+      <div class="mfields">
+        <input id="pump-val" type="number" min="0" placeholder="∞">
+        <select id="pump-unit">
+          <option value="1">sec</option>
+          <option value="60">min</option>
+          <option value="3600">hours</option>
+        </select>
+      </div>
+      <span class="mhint">Duration the pump stays on. Leave empty = stays on indefinitely.</span>
+    </div>
+
+    <div class="mrow">
+      <button id="btn-feed" class="mbtn" onclick="dispenseFood()">Dispense food</button>
+      <div class="mfields">
+        <input id="feed-val" type="number" min="0" placeholder="once">
+        <select id="feed-unit">
+          <option value="1">sec</option>
+          <option value="60">min</option>
+          <option value="3600">hours</option>
+        </select>
+      </div>
+      <span class="mhint">Repeat interval for the servo. Leave empty = dispense once.</span>
+    </div>
+
+    <div class="mrow">
+      <button id="btn-cal" class="mbtn warn" onclick="calibrate()">Calibrate</button>
+      <span class="mhint">Learns the pump's normal current baseline (~10 s).</span>
+      <span id="cal-warn" class="mwarn">⚠ Turn the pump ON first, then calibrate — otherwise the baseline is idle current and the pump will trip a false stall the moment it runs.</span>
+    </div>
+  </div>
+
+  <!-- HALT recovery lives OUTSIDE the manual panel so it stays clickable even
+       in automatic mode (where the manual panel is locked / non-interactive). -->
+  <div id="halt-row" class="manual" style="display:none;margin-top:10px">
+    <div class="mrow">
+      <button id="btn-clrhalt" class="mbtn" style="border-color:var(--danger);color:var(--danger)" onclick="clearHalt()">Clear HALT</button>
+      <span class="mhint">The pump was halted by a stall / dry-run anomaly. Clear to recover — in automatic mode this restarts a fresh cycle; in manual mode it returns to idle. Investigate the pump before running again.</span>
+    </div>
+  </div>
+
   <div class="chart-box">
     <div class="ch">
       <div class="ct">Current pump</div>
@@ -184,8 +270,11 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
 
 <script>
 const N=80;
-let cCur=null, thStall=null, thDry=null, lastEvtId=0, failing=0;
+let cCur=null, thStall=null, thDry=null, lastEvtId=0, failing=0, toastsArmed=false;
 let togglePending=false;   // ignore /data sync while a toggle is in flight
+let pumpOn=false;          // last known pump state from /data
+let autoOn=true;           // last known default-mode state
+let halted=false;          // last known halt state
 
 function seq(){return Array(N).fill(null)}
 
@@ -230,15 +319,23 @@ async function pollData(){
     set('v-cur',  d.I.toFixed(1));
     set('v-turb', d.turb>=0?d.turb.toFixed(0):'—');
     const p=document.getElementById('phase');
-    const m=d.locked?'HALTED':d.mode;
+    const m=(d.locked||d.thalt)?'HALTED':d.mode;
     p.textContent=m; p.className='phase '+m;
-    if(d.th_stall>0 && d.th_stall!==thStall){thStall=d.th_stall;flat(2,thStall)}
-    if(d.th_dry>0   && d.th_dry!==thDry)   {thDry=d.th_dry;     flat(3,thDry)}
+    // Threshold dashed lines: draw while calibrated; clear them the moment the
+    // observer reports no calibration (th=0), e.g. after a mode change.
+    if(d.th_stall>0){ if(d.th_stall!==thStall){thStall=d.th_stall; flat(2,thStall);} }
+    else if(thStall!==null){ thStall=null; flat(2,NaN); }
+    if(d.th_dry>0){ if(d.th_dry!==thDry){thDry=d.th_dry; flat(3,thDry);} }
+    else if(thDry!==null){ thDry=null; flat(3,NaN); }
     push(0,d.I); push(1,d.I_ewma);
     cCur.update('none');
     // Keep the default-mode toggle in sync with the observer's NVS state
     // (unless we're mid-toggle, to avoid bouncing while the request flies).
     if(!togglePending && typeof d.auto === 'boolean') syncToggle(d.auto);
+    // Manual controls: enabled only when default mode is OFF.
+    if(typeof d.auto === 'boolean') setManualEnabled(!d.auto);
+    if(typeof d.pump === 'boolean') syncPump(d.pump);
+    syncHalt(!!d.locked || !!d.thalt, !d.auto);
     setConn(true);
   }catch(e){ if(++failing>3) setConn(false); }
 }
@@ -265,11 +362,113 @@ function syncToggle(on){
   st.className = 'toggle-state ' + (on ? 'on' : 'off');
 }
 
+// Enable/disable the whole manual panel based on default mode.
+function setManualEnabled(enabled){
+  autoOn = !enabled;
+  const panel = document.getElementById('manual');
+  panel.className = 'manual' + (enabled ? '' : ' locked');
+  ['btn-pump','btn-feed','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
+    .forEach(id=>{ const e=document.getElementById(id); if(e) e.disabled = !enabled; });
+}
+
+// Reflect pump state on the toggle-pump button.
+function syncPump(on){
+  pumpOn = on;
+  const b = document.getElementById('btn-pump');
+  b.textContent = 'Pump: ' + (on ? 'ON' : 'OFF');
+  b.className = 'mbtn' + (on ? ' on' : '');
+  // Show the calibrate warning only when about to calibrate with pump off.
+  document.getElementById('cal-warn').className = 'mwarn' + (on ? '' : ' show');
+}
+
+// Read a value+unit field, return seconds (0 if empty / invalid).
+function readSeconds(valId, unitId){
+  const v = parseFloat(document.getElementById(valId).value);
+  if (!isFinite(v) || v <= 0) return 0;
+  const mult = parseInt(document.getElementById(unitId).value, 10) || 1;
+  return Math.round(v * mult);
+}
+
+async function sendCmd(qs){
+  try{ await fetch('/cmd?' + qs); }catch(_){ /* /data will re-sync */ }
+}
+
+function togglePump(){
+  if (autoOn) return;
+  if (pumpOn){
+    syncPump(false);              // optimistic
+    sendCmd('a=pump_off');
+  } else {
+    const sec = readSeconds('pump-val','pump-unit');
+    syncPump(true);               // optimistic
+    sendCmd('a=pump_on&sec=' + sec);
+  }
+}
+
+function dispenseFood(){
+  if (autoOn) return;
+  const sec = readSeconds('feed-val','feed-unit');
+  sendCmd('a=feed&sec=' + sec);
+}
+
+function calibrate(){
+  if (autoOn) return;
+  sendCmd('a=calibrate');
+}
+
+// Reflect halt state: in OFF mode, a halt shows the Clear HALT row and locks
+// the pump/feed/calibrate buttons until the user clears it.
+function syncHalt(isHalted, manualMode){
+  halted = isHalted;
+  const row = document.getElementById('halt-row');
+  // Show the Clear HALT panel whenever halted, in BOTH automatic and manual
+  // mode (it lives outside the manual panel so it stays clickable when auto).
+  row.style.display = isHalted ? 'block' : 'none';
+  // While halted in manual mode, disable the normal controls (only Clear HALT).
+  if (manualMode){
+    const dis = isHalted;
+    ['btn-pump','btn-feed','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
+      .forEach(id=>{ const e=document.getElementById(id); if(e) e.disabled = dis; });
+  }
+}
+
+function clearHalt(){
+  // Allowed in both modes: in auto it restarts a fresh cycle, in manual it
+  // returns to idle. The observer accepts clear_halt regardless of mode.
+  sendCmd('a=clear_halt');
+}
+
 async function pollEvents(){
   try{
     const arr=await(await fetch('/events?last='+lastEvtId)).json();
-    for(const e of arr){ if(e.id>lastEvtId){lastEvtId=e.id; addEvt(e);} }
+    for(const e of arr){ if(e.id>lastEvtId){lastEvtId=e.id; addEvt(e);
+      if(toastsArmed && (e.type==='halt'||e.type==='warn')) showToast(e.type, e.msg); } }
+    toastsArmed=true;   // only toast events that arrive AFTER the first load
   }catch(_){}
+}
+
+// Top-right pop-up notification. Red ('halt') for anomalies that stop the pump
+// (motor stall, dry-run); orange ('warn') for advisory ones (voltage, temp).
+function showToast(type, reason){
+  const labels={
+    MOTOR_STALL:'Stallo motore — sistema in HALT',
+    DRY_RUN:'Funzionamento a secco — sistema in HALT',
+    VOLTAGE_DROP:'Tensione di alimentazione bassa',
+    TEMP_TOO_HIGH:'Temperatura troppo alta',
+    TEMP_TOO_LOW:'Temperatura troppo bassa'};
+  const title = type==='halt' ? 'HALT' : 'Attenzione';
+  const icon  = type==='halt' ? '⛔' : '⚠';
+  const msg   = labels[reason] || reason;
+  const c=document.getElementById('toasts');
+  const t=document.createElement('div');
+  t.className='toast '+type;
+  t.innerHTML='<span class="ti">'+icon+'</span><span><span class="tt">'+title+
+              '</span>'+esc(msg)+'</span>';
+  const kill=()=>{ t.classList.add('fade'); setTimeout(()=>t.remove(),350); };
+  t.onclick=kill;
+  c.appendChild(t);
+  setTimeout(kill, type==='halt'?12000:7000);
+  while(c.children.length>4) c.removeChild(c.firstChild);
 }
 
 function startPolling(){
