@@ -89,9 +89,20 @@ RTC_DATA_ATTR float    last_valid_temp   = 20.0f;
 // ── Globals ────────────────────────────────────────────────────────────────
 uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60};
 
+// ESP-NOW link encryption (AES-CCM). The PMK and the per-peer LMK MUST be
+// byte-for-byte identical on Target and Observer. They authenticate and encrypt
+// every unicast frame, so a spoofed HALT/PUMP command can't be injected over
+// the air. 16 bytes each — change them before any real deployment.
+static const uint8_t ESPNOW_PMK[16] = {'F','L','O','A','T','-','p','m','k','-','v','9','-','a','q','1'};
+static const uint8_t ESPNOW_LMK[16] = {'F','L','O','A','T','-','l','m','k','-','v','9','-','a','q','1'};
+
 volatile bool     emergency_stop = false;
 volatile bool     ack_received   = false;
 volatile uint32_t acked_id       = 0;
+
+// Why we are halted, when known (RAM only, set this boot). Appended to the
+// "[HALT]" message so a storm/fault-loop halt is no longer "from nowhere".
+const char*       haltCause      = nullptr;
 
 OneWire           oneWire(DS18B20_PIN);
 DallasTemperature tempSensor(&oneWire);
@@ -127,6 +138,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         digitalWrite(PUMP_PIN, LOW);
         prefs.putBool("halted", false);
         prefs.putInt("storm", 0);
+        prefs.putBool("pumping", false);
         if (autoCycleEnabled) {
             bootCount         = 0;          // fresh learning cycle after recovery
             consecutive_noack = 0;
@@ -211,6 +223,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             prefs.putBool("auto",   true);
             prefs.putBool("halted", false);
             prefs.putInt("storm", 0);
+            prefs.putBool("pumping", false);
             restart_requested = true;
             Serial.println("[TGT] Default mode → ON + RESET (restart pending)");
         }
@@ -237,6 +250,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             prefs.putBool("auto",   true);
             prefs.putBool("halted", false);
             prefs.putInt("storm", 0);
+            prefs.putBool("pumping", false);
             restart_requested = true;
             Serial.println("[TGT] Default mode → ON, keeping manual calibration (boot 1)");
         }
@@ -452,34 +466,49 @@ void setup() {
     if (!system_halted) system_halted = prefs.getBool("halted", false);
     autoCycleEnabled = prefs.getBool("auto", true);
 
-    // ── Fresh-power-on halt handling ──────────────────────────────────────
+    // ── Fresh-power-on halt handling (pump-load reset storm) ──────────────
     // The NVS "halted" latch protects against re-running the pump after a
     // stall, even across a power loss. But a deliberate power-on must be able
     // to start fresh (the user expects a new learning cycle); otherwise a
-    // stale latch from a previous test session blocks startup forever — which
-    // is exactly the "learning never starts" symptom in the logs.
+    // stale latch from a previous test session blocks startup forever — the
+    // "learning never starts" symptom.
     //
-    // We can't tell a clean power-on from a stall-induced brownout by reset
-    // reason alone (both wipe RTC and report POWERON with brown-out disabled).
-    // So we keep an NVS "storm" counter: every RTC-wiping reset bumps it; a
-    // clean monitored cycle (or a dashboard Clear HALT / mode reset) clears it.
-    //  - storm ≤ 3: treat as a genuine (re)start — clear any stale halt latch so
-    //    the system learns/runs fresh instead of being stuck from a prior session.
-    //  - storm > 3: the device keeps resetting without ever finishing a clean
-    //    cycle — typically a pump stall that browns out the supply, looping the
-    //    learning phase forever. Force a halt (and stay awake, handled below) so
-    //    the dashboard shows HALTED and the user can fix the pump + Clear HALT.
+    // We can't tell a clean power-on from a brownout by reset reason alone
+    // (both wipe RTC and report POWERON with brown-out detect disabled). So we
+    // keep an NVS "pumping" marker: it is set true only while the pump is
+    // actually driving load during a cycle, and cleared at end of cycle. At
+    // boot we read it back BEFORE the cycle:
+    //  - reset while pumping=true  → a reset happened under pump current,
+    //    i.e. a stall/brownout under load. Count it in the "storm" counter;
+    //    if too many pile up without a clean cycle in between, the supply is
+    //    clearly inadequate under load → force a halt (and announce the cause).
+    //  - reset while pumping=false → an IDLE / deep-sleep power glitch, NOT a
+    //    fault loop. We do NOT count it (this is the key fix: weak-supply idle
+    //    brownouts no longer accumulate into a phantom halt) and simply clear
+    //    any stale halt latch so the device starts fresh.
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {   // RTC wiped: power-on / brownout / SW reset
-        int storm = prefs.getInt("storm", 0) + 1;
-        prefs.putInt("storm", storm);
-        if (storm > 3) {
-            system_halted = true;
-            prefs.putBool("halted", true);
-            Serial.printf("[TGT] Reset storm=%d — fault loop suspected, halting for safety\n", storm);
+        bool wasPumping = prefs.getBool("pumping", false);
+        prefs.putBool("pumping", false);             // consume the marker
+        if (wasPumping) {
+            int storm = prefs.getInt("storm", 0) + 1;
+            prefs.putInt("storm", storm);
+            if (storm > 5) {
+                system_halted = true;
+                prefs.putBool("halted", true);
+                haltCause = "reset loop under pump load — check power supply";
+                Serial.printf("[TGT] Pump-load reset storm=%d — halting for safety\n", storm);
+            } else {
+                // A few pump-load resets but not a sustained loop: clear any
+                // stale latch and let the cycle retry.
+                if (system_halted) { system_halted = false; prefs.putBool("halted", false); }
+                Serial.printf("[TGT] Pump-load reset (storm=%d) — retrying fresh\n", storm);
+            }
         } else if (system_halted) {
+            // Idle/deep-sleep glitch or deliberate power-on with a stale latch:
+            // start fresh. Idle brownouts intentionally do NOT touch "storm".
             system_halted = false;
             prefs.putBool("halted", false);
-            Serial.printf("[TGT] Power-on (storm=%d) — cleared stale halt, starting fresh\n", storm);
+            Serial.println("[TGT] Power-on (idle) — cleared stale halt, starting fresh");
         }
     }
 
@@ -519,11 +548,17 @@ void setup() {
 
     if (esp_now_init() == ESP_OK) {
         esp_now_register_recv_cb(OnDataRecv);
+        esp_now_set_pmk(ESPNOW_PMK);              // shared primary master key
         esp_now_peer_info_t peer;
         memset(&peer, 0, sizeof(peer));
         memcpy(peer.peer_addr, observerAddress, 6);
-        peer.channel = obs_channel;
-        peer.encrypt = false;
+        // channel 0 = "use the current radio channel". The radio is pinned to
+        // the hotspot channel by the scan above; sending on the current channel
+        // (rather than a value captured once) keeps ESP-NOW working even if the
+        // hotspot hops channels between wakes.
+        peer.channel = 0;
+        memcpy(peer.lmk, ESPNOW_LMK, 16);         // per-peer key → AES-CCM
+        peer.encrypt = true;
         esp_now_add_peer(&peer);
     } else {
         Serial.println("[TGT] ESP-NOW init failed — going to sleep");
@@ -584,8 +619,10 @@ void setup() {
     // manual-mode HALT. Recovery via Clear HALT: in auto mode it reboots into a
     // fresh cycle, in manual mode it returns to idle (handled in CMD:CLEAR_HALT).
     if (system_halted) {
-        sendMsg("LOG", "[HALT] Halted — pump locked. "
-                       "Press 'Clear HALT' on the dashboard to recover.");
+        String hmsg = "[HALT] Halted — pump locked. "
+                      "Press 'Clear HALT' on the dashboard to recover.";
+        if (haltCause) hmsg += String("  (cause: ") + haltCause + ")";
+        sendMsg("LOG", hmsg);
         return;
     }
 
@@ -610,6 +647,12 @@ void setup() {
     // it doesn't rely on HALT reaching the target during the noisiest moment
     // (high pump current + voltage sag).
     prefs.putBool("halted", true);
+
+    // Mark that we are entering an active cycle that drives the pump. If a
+    // reset hits between here and the end-of-cycle clear below, the next boot
+    // attributes it to pump load (storm counter). Idle/sleep resets, which
+    // never reach this line, are therefore not counted.
+    prefs.putBool("pumping", true);
 
     if (bootCount == 0) {
         // ── First boot: calibration learning phase ────────────────────────
@@ -710,6 +753,11 @@ void setup() {
 
     // ── End of cycle ──────────────────────────────────────────────────────
 
+    // Pump is off in every branch by now → clear the pump-load marker so a
+    // reset during the upcoming sleep/idle is treated as a harmless glitch,
+    // not a pump-load fault.
+    prefs.putBool("pumping", false);
+
     // SAFETY LATCH OFF: only clear halted=true if the cycle completed without
     // any anomaly. The 500ms wait gives the Observer one last chance to push
     // a HALT we might have missed earlier (e.g., its first HALT was lost
@@ -726,8 +774,10 @@ void setup() {
     // the dashboard shows HALTED and Clear HALT can reach us — same as manual
     // mode. loop() takes over and keeps sending heartbeats.
     if (system_halted) {
-        sendMsg("LOG", "[HALT] Halted — pump locked. "
-                       "Press 'Clear HALT' on the dashboard to recover.");
+        String hmsg = "[HALT] Halted — pump locked. "
+                      "Press 'Clear HALT' on the dashboard to recover.";
+        if (haltCause) hmsg += String("  (cause: ") + haltCause + ")";
+        sendMsg("LOG", hmsg);
         return;
     }
 

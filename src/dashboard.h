@@ -164,6 +164,14 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
 .toast.warn{border-left-color:#f5a623;background:#2a2418}
 .toast.fade{opacity:0;transform:translateX(12px);transition:all .35s ease}
 @keyframes tin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+.eval-stats{font-size:12.5px;color:var(--muted,#9fb0c8);margin:8px 0;line-height:1.5}
+.eval-tab{border-collapse:collapse;font-size:11px;width:100%;margin-top:4px}
+.eval-tab th,.eval-tab td{border:1px solid #2a3346;padding:3px 5px;text-align:center}
+.eval-tab th{color:#9fb0c8;font-weight:600}
+.eval-tab td.diag{background:rgba(0,229,200,.14);font-weight:700}
+.eval-tab td.hit{color:#e8edf6}
+.eval-tab td.zero{color:#566}
+.mbtn.act{outline:2px solid #00e5c8}
 </style>
 </head>
 <body>
@@ -262,6 +270,18 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
     <div class="evts-t">Live events</div>
     <div id="elist" class="elist">
       <div class="ei log"><span class="ets">—</span><span class="em">Waiting for new events…</span></div>
+    </div>
+  </div>
+
+  <div class="evts" id="evalpanel">
+    <div class="evts-t">Valutazione — matrice di confusione</div>
+    <div class="manual-sub">Imposta la verità del ciclo che stai per eseguire, poi fai girare cicli monitorati (più semplice in Default mode ON). Ogni ciclo registra un esito.</div>
+    <div class="mrow" id="eval-btns"></div>
+    <div id="eval-stats" class="eval-stats">Etichettatura disattivata — scegli una classe per iniziare.</div>
+    <table id="eval-tab" class="eval-tab"></table>
+    <div class="mrow" style="margin-top:8px">
+      <button class="mbtn" onclick="evalOff()">Stop etichettatura</button>
+      <button class="mbtn warn" onclick="evalReset()">Reset matrice</button>
     </div>
   </div>
 
@@ -455,7 +475,8 @@ function showToast(type, reason){
     DRY_RUN:'Funzionamento a secco — sistema in HALT',
     VOLTAGE_DROP:'Tensione di alimentazione bassa',
     TEMP_TOO_HIGH:'Temperatura troppo alta',
-    TEMP_TOO_LOW:'Temperatura troppo bassa'};
+    TEMP_TOO_LOW:'Temperatura troppo bassa',
+    DEGRADATION:'Degrado pompa — manutenzione consigliata'};
   const title = type==='halt' ? 'HALT' : 'Attenzione';
   const icon  = type==='halt' ? '⛔' : '⚠';
   const msg   = labels[reason] || reason;
@@ -472,9 +493,64 @@ function showToast(type, reason){
 }
 
 function startPolling(){
-  pollData(); pollEvents();
+  buildEvalBtns(); pollData(); pollEvents(); pollEval();
   setInterval(pollData,  600);   // was 400 — reduces concurrent load on observer
   setInterval(pollEvents,1500);  // was 700 — events are rarer, can poll slower
+  setInterval(pollEval,  1500);
+}
+
+const EVAL_LABELS=['Normale','Stallo','Dry-run','Tensione','Temp alta','Temp bassa'];
+const EVAL_SHORT =['NOR','STA','DRY','VLT','T+','T-'];
+let evalTruth=-1;
+function buildEvalBtns(){
+  const c=document.getElementById('eval-btns');
+  c.innerHTML='';
+  EVAL_LABELS.forEach((lab,k)=>{
+    const b=document.createElement('button');
+    b.className='mbtn'; b.id='ev-'+k; b.textContent=lab;
+    b.onclick=()=>setTruth(k);
+    c.appendChild(b);
+  });
+}
+async function setTruth(k){ evalTruth=k; await sendCmd0('/eval?truth='+k); markTruth(); pollEval(); }
+async function evalOff(){ evalTruth=-1; await sendCmd0('/eval?off=1'); markTruth(); pollEval(); }
+async function evalReset(){ await sendCmd0('/eval?reset=1'); pollEval(); }
+async function sendCmd0(u){ try{ await fetch(u); }catch(_){} }
+function markTruth(){
+  for(let k=0;k<6;k++){ const b=document.getElementById('ev-'+k); if(b) b.className='mbtn'+(k===evalTruth?' act':''); }
+}
+async function pollEval(){
+  try{
+    const d=await(await fetch('/eval')).json();
+    evalTruth=d.truth; markTruth(); renderEval(d);
+  }catch(_){}
+}
+function renderEval(d){
+  const m=d.m, T=6;
+  let tot=0,diag=0,fpRow=0,fpErr=0,fnRow=0,fnMiss=0;
+  for(let i=0;i<T;i++)for(let j=0;j<T;j++){
+    const v=m[i*T+j]; tot+=v; if(i===j)diag+=v;
+    if(i===0){ if(j!==0)fpErr+=v; fpRow+=v; }       // truth NORMAL → false positives
+    else { fnRow+=v; if(j===0)fnMiss+=v; }           // truth fault → missed (FN)
+  }
+  const acc=tot?(100*diag/tot):0, fpr=fpRow?(100*fpErr/fpRow):0, fnr=fnRow?(100*fnMiss/fnRow):0;
+  const st=document.getElementById('eval-stats');
+  const cur=(d.truth>=0)?('Verità attiva: <b>'+EVAL_LABELS[d.truth]+'</b>'):'Etichettatura disattivata';
+  st.innerHTML=cur+' · campioni: <b>'+d.count+'</b> · accuratezza: <b>'+acc.toFixed(0)+
+    '%</b> · falsi positivi: <b>'+fpr.toFixed(0)+'%</b> · falsi negativi: <b>'+fnr.toFixed(0)+
+    '%</b> · latenza media: <b>'+d.lat+' ms</b>';
+  let h='<tr><th>↓v r→</th>';
+  for(let j=0;j<T;j++) h+='<th>'+EVAL_SHORT[j]+'</th>';
+  h+='</tr>';
+  for(let i=0;i<T;i++){
+    h+='<tr><th>'+EVAL_SHORT[i]+'</th>';
+    for(let j=0;j<T;j++){ const v=m[i*T+j];
+      const cls=(i===j)?'diag':(v>0?'hit':'zero');
+      h+='<td class="'+cls+'">'+v+'</td>';
+    }
+    h+='</tr>';
+  }
+  document.getElementById('eval-tab').innerHTML=h;
 }
 
 function set(id,v){const e=document.getElementById(id); if(e)e.textContent=v}
