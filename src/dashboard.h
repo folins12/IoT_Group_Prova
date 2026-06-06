@@ -1,11 +1,11 @@
 #ifndef DASHBOARD_H
 #define DASHBOARD_H
 
-// Static dashboard served by the Observer. Connects to the observer over WiFi
-// (the iPhone hotspot network) and polls /data + /events. No buttons — read-only
-// live view: motor-current chart with stall & dry-run dashed thresholds, plus
-// live cards for temperature, current and turbidity.
-// Chart.js is loaded from CDN; this works because the phone hotspot has internet.
+// Static dashboard served by the Observer over WiFi. Polls /data + /events.
+// Live current chart (raw + EWMA + stall/dry-run threshold lines), sensor cards,
+// default-mode toggle, manual controls (OFF mode only) and HALT recovery.
+// Developer-only evaluation panel (confusion matrix) shown when the URL has ?dev.
+// Chart.js is loaded from CDN (the hotspot has internet).
 
 const char* html_page = R"rawliteral(
 <!DOCTYPE html>
@@ -77,7 +77,7 @@ header{display:flex;align-items:center;justify-content:space-between;flex-wrap:w
 .switch input:checked + .slider::before{transform:translateX(16px)}
 .switch input:disabled + .slider{opacity:.5;cursor:not-allowed}
 
-/* Manual controls (enabled only when default mode is OFF) */
+/* Manual controls */
 .manual{background:var(--card);border:1px solid var(--border);border-radius:var(--r);
   padding:16px;box-shadow:var(--sh);transition:opacity .3s}
 .manual.locked{opacity:.45;pointer-events:none}
@@ -176,13 +176,13 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
 </head>
 <body>
 <div id="toasts"></div>
-<div id="lost">⚠ Connessione persa — riprovo…</div>
+<div id="lost">&#9888; Connection lost &mdash; retrying&hellip;</div>
 <div class="app">
 
   <header>
     <div class="brand">
-      <div class="bi">🌊</div>
-      <div><div class="bn">FLOAT Aquarium</div><div class="bs">Monitor live — Observer</div></div>
+      <div class="bi">&#127754;</div>
+      <div><div class="bn">FLOAT Aquarium</div><div class="bs">Live monitor &mdash; Observer</div></div>
     </div>
     <div class="hr">
       <div class="toggle-wrap">
@@ -194,17 +194,17 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
         <span id="tg-state" class="toggle-state on">ON</span>
       </div>
       <span id="phase" class="phase">IDLE</span>
-      <div class="conn"><div id="dot" class="dot"></div><span id="conn">Connecting…</span></div>
+      <div class="conn"><div id="dot" class="dot"></div><span id="conn">Connecting&hellip;</span></div>
     </div>
   </header>
 
   <div class="cards">
     <div class="card temp"><div class="cl">Temperature</div>
-      <div id="v-temp" class="cv t-yel">—</div><div class="cu">°C</div></div>
+      <div id="v-temp" class="cv t-yel">&mdash;</div><div class="cu">&deg;C</div></div>
     <div class="card cur"><div class="cl">Current</div>
-      <div id="v-cur" class="cv t-blue">—</div><div class="cu">mA</div></div>
+      <div id="v-cur" class="cv t-blue">&mdash;</div><div class="cu">mA</div></div>
     <div class="card turb"><div class="cl">Turbidity</div>
-      <div id="v-turb" class="cv t-pur">—</div><div class="cu">NTU</div></div>
+      <div id="v-turb" class="cv t-pur">&mdash;</div><div class="cu">NTU</div></div>
   </div>
 
   <div id="manual" class="manual locked">
@@ -214,7 +214,7 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
     <div class="mrow">
       <button id="btn-pump" class="mbtn" onclick="togglePump()">Pump: OFF</button>
       <div class="mfields">
-        <input id="pump-val" type="number" min="0" placeholder="∞">
+        <input id="pump-val" type="number" min="0" placeholder="&infin;">
         <select id="pump-unit">
           <option value="1">sec</option>
           <option value="60">min</option>
@@ -226,6 +226,7 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
 
     <div class="mrow">
       <button id="btn-feed" class="mbtn" onclick="dispenseFood()">Dispense food</button>
+      <button id="btn-feedstop" class="mbtn" onclick="stopFeeding()">Stop feeding</button>
       <div class="mfields">
         <input id="feed-val" type="number" min="0" placeholder="once">
         <select id="feed-unit">
@@ -234,28 +235,27 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
           <option value="3600">hours</option>
         </select>
       </div>
-      <span class="mhint">Repeat interval for the servo. Leave empty = dispense once.</span>
+      <span class="mhint">Repeat interval for the servo. Leave empty = dispense once. "Stop feeding" cancels a repeating schedule.</span>
     </div>
 
     <div class="mrow">
       <button id="btn-cal" class="mbtn warn" onclick="calibrate()">Calibrate</button>
       <span class="mhint">Learns the pump's normal current baseline (~10 s).</span>
-      <span id="cal-warn" class="mwarn">⚠ Turn the pump ON first, then calibrate — otherwise the baseline is idle current and the pump will trip a false stall the moment it runs.</span>
+      <span id="cal-warn" class="mwarn">&#9888; Turn the pump ON first, then calibrate &mdash; otherwise the baseline is idle current and the pump will trip a false stall the moment it runs.</span>
     </div>
   </div>
 
-  <!-- HALT recovery lives OUTSIDE the manual panel so it stays clickable even
-       in automatic mode (where the manual panel is locked / non-interactive). -->
+  <!-- Clear HALT lives outside the manual panel so it stays clickable in automatic mode. -->
   <div id="halt-row" class="manual" style="display:none;margin-top:10px">
     <div class="mrow">
       <button id="btn-clrhalt" class="mbtn" style="border-color:var(--danger);color:var(--danger)" onclick="clearHalt()">Clear HALT</button>
-      <span class="mhint">The pump was halted by a stall / dry-run anomaly. Clear to recover — in automatic mode this restarts a fresh cycle; in manual mode it returns to idle. Investigate the pump before running again.</span>
+      <span class="mhint">The pump was halted by a stall / dry-run anomaly. Clear to recover &mdash; in automatic mode this restarts a fresh cycle; in manual mode it returns to idle. Investigate the pump before running again.</span>
     </div>
   </div>
 
   <div class="chart-box">
     <div class="ch">
-      <div class="ct">Current pump</div>
+      <div class="ct">Pump current</div>
       <div class="legend">
         <div class="li"><span class="lb" style="background:#38b2ff"></span>Raw</div>
         <div class="li"><span class="lb" style="background:#00e5c8"></span>EWMA</div>
@@ -269,32 +269,31 @@ footer{text-align:center;font-size:.65rem;color:var(--faint);padding:4px}
   <div class="evts">
     <div class="evts-t">Live events</div>
     <div id="elist" class="elist">
-      <div class="ei log"><span class="ets">—</span><span class="em">Waiting for new events…</span></div>
+      <div class="ei log"><span class="ets">&mdash;</span><span class="em">Waiting for new events&hellip;</span></div>
     </div>
   </div>
 
-  <div class="evts" id="evalpanel">
-    <div class="evts-t">Valutazione — matrice di confusione</div>
-    <div class="manual-sub">Imposta la verità del ciclo che stai per eseguire, poi fai girare cicli monitorati (più semplice in Default mode ON). Ogni ciclo registra un esito.</div>
+  <div class="evts" id="evalpanel" style="display:none">
+    <div class="evts-t">Evaluation &mdash; confusion matrix</div>
+    <div class="manual-sub">Set the ground truth for the cycle you are about to run, then run monitored cycles (easiest in Default mode ON). Each cycle records one outcome.</div>
     <div class="mrow" id="eval-btns"></div>
-    <div id="eval-stats" class="eval-stats">Etichettatura disattivata — scegli una classe per iniziare.</div>
+    <div id="eval-stats" class="eval-stats">Labelling off &mdash; pick a class to start.</div>
     <table id="eval-tab" class="eval-tab"></table>
     <div class="mrow" style="margin-top:8px">
-      <button class="mbtn" onclick="evalOff()">Stop etichettatura</button>
-      <button class="mbtn warn" onclick="evalReset()">Reset matrice</button>
+      <button class="mbtn" onclick="evalOff()">Stop labelling</button>
+      <button class="mbtn warn" onclick="evalReset()">Reset matrix</button>
     </div>
   </div>
 
-  <footer>FLOAT Aquarium Control · polling live</footer>
+  <footer>FLOAT Aquarium Control &middot; live polling</footer>
 </div>
 
 <script>
 const N=80;
 let cCur=null, thStall=null, thDry=null, lastEvtId=0, failing=0, toastsArmed=false;
 let togglePending=false;   // ignore /data sync while a toggle is in flight
-let pumpOn=false;          // last known pump state from /data
-let autoOn=true;           // last known default-mode state
-let halted=false;          // last known halt state
+let pumpOn=false, autoOn=true, halted=false;
+const DEV = location.search.indexOf('dev') >= 0;   // ?dev shows the evaluation panel
 
 function seq(){return Array(N).fill(null)}
 
@@ -335,24 +334,20 @@ async function pollData(){
   try{
     const d=await(await fetch('/data')).json();
     failing=0;
-    set('v-temp', d.T>-50?d.T.toFixed(1):'—');
+    set('v-temp', d.T>-50?d.T.toFixed(1):'\u2014');
     set('v-cur',  d.I.toFixed(1));
-    set('v-turb', d.turb>=0?d.turb.toFixed(0):'—');
+    set('v-turb', d.turb>=0?d.turb.toFixed(0):'\u2014');
     const p=document.getElementById('phase');
     const m=(d.locked||d.thalt)?'HALTED':d.mode;
     p.textContent=m; p.className='phase '+m;
-    // Threshold dashed lines: draw while calibrated; clear them the moment the
-    // observer reports no calibration (th=0), e.g. after a mode change.
+    // threshold lines: drawn while calibrated, cleared when th=0 (e.g. after a mode change)
     if(d.th_stall>0){ if(d.th_stall!==thStall){thStall=d.th_stall; flat(2,thStall);} }
     else if(thStall!==null){ thStall=null; flat(2,NaN); }
     if(d.th_dry>0){ if(d.th_dry!==thDry){thDry=d.th_dry; flat(3,thDry);} }
     else if(thDry!==null){ thDry=null; flat(3,NaN); }
     push(0,d.I); push(1,d.I_ewma);
     cCur.update('none');
-    // Keep the default-mode toggle in sync with the observer's NVS state
-    // (unless we're mid-toggle, to avoid bouncing while the request flies).
     if(!togglePending && typeof d.auto === 'boolean') syncToggle(d.auto);
-    // Manual controls: enabled only when default mode is OFF.
     if(typeof d.auto === 'boolean') setManualEnabled(!d.auto);
     if(typeof d.pump === 'boolean') syncPump(d.pump);
     syncHalt(!!d.locked || !!d.thalt, !d.auto);
@@ -360,20 +355,16 @@ async function pollData(){
   }catch(e){ if(++failing>3) setConn(false); }
 }
 
-// User clicked the toggle in the UI.
+// toggle default mode (optimistic UI, then POST; /data re-syncs)
 async function setAutoMode(on){
   togglePending = true;
-  syncToggle(on);   // optimistic UI update
+  syncToggle(on);
   const tg = document.getElementById('tg-auto'); tg.disabled = true;
-  try{
-    await fetch('/mode?set=' + (on?'on':'off'));
-  }catch(_){ /* if the call fails, /data will eventually re-sync */ }
+  try{ await fetch('/mode?set=' + (on?'on':'off')); }catch(_){}
   tg.disabled = false;
-  // Give the observer a moment to settle before re-syncing from /data
   setTimeout(()=>{ togglePending = false; }, 1500);
 }
 
-// Reflect a boolean auto-mode state into the UI without firing onchange.
 function syncToggle(on){
   const tg = document.getElementById('tg-auto');
   if (tg.checked !== on) tg.checked = on;
@@ -382,26 +373,24 @@ function syncToggle(on){
   st.className = 'toggle-state ' + (on ? 'on' : 'off');
 }
 
-// Enable/disable the whole manual panel based on default mode.
+// enable/disable the manual panel by default mode
 function setManualEnabled(enabled){
   autoOn = !enabled;
   const panel = document.getElementById('manual');
   panel.className = 'manual' + (enabled ? '' : ' locked');
-  ['btn-pump','btn-feed','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
+  ['btn-pump','btn-feed','btn-feedstop','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
     .forEach(id=>{ const e=document.getElementById(id); if(e) e.disabled = !enabled; });
 }
 
-// Reflect pump state on the toggle-pump button.
 function syncPump(on){
   pumpOn = on;
   const b = document.getElementById('btn-pump');
   b.textContent = 'Pump: ' + (on ? 'ON' : 'OFF');
   b.className = 'mbtn' + (on ? ' on' : '');
-  // Show the calibrate warning only when about to calibrate with pump off.
   document.getElementById('cal-warn').className = 'mwarn' + (on ? '' : ' show');
 }
 
-// Read a value+unit field, return seconds (0 if empty / invalid).
+// value + unit -> seconds (0 if empty/invalid)
 function readSeconds(valId, unitId){
   const v = parseFloat(document.getElementById(valId).value);
   if (!isFinite(v) || v <= 0) return 0;
@@ -409,18 +398,16 @@ function readSeconds(valId, unitId){
   return Math.round(v * mult);
 }
 
-async function sendCmd(qs){
-  try{ await fetch('/cmd?' + qs); }catch(_){ /* /data will re-sync */ }
-}
+async function sendCmd(qs){ try{ await fetch('/cmd?' + qs); }catch(_){} }
 
 function togglePump(){
   if (autoOn) return;
   if (pumpOn){
-    syncPump(false);              // optimistic
+    syncPump(false);
     sendCmd('a=pump_off');
   } else {
     const sec = readSeconds('pump-val','pump-unit');
-    syncPump(true);               // optimistic
+    syncPump(true);
     sendCmd('a=pump_on&sec=' + sec);
   }
 }
@@ -431,54 +418,51 @@ function dispenseFood(){
   sendCmd('a=feed&sec=' + sec);
 }
 
+// cancel a repeating feed schedule
+function stopFeeding(){
+  if (autoOn) return;
+  sendCmd('a=feed_stop');
+}
+
 function calibrate(){
   if (autoOn) return;
   sendCmd('a=calibrate');
 }
 
-// Reflect halt state: in OFF mode, a halt shows the Clear HALT row and locks
-// the pump/feed/calibrate buttons until the user clears it.
+// halt state: show Clear HALT (both modes); lock manual buttons while halted in OFF
 function syncHalt(isHalted, manualMode){
   halted = isHalted;
   const row = document.getElementById('halt-row');
-  // Show the Clear HALT panel whenever halted, in BOTH automatic and manual
-  // mode (it lives outside the manual panel so it stays clickable when auto).
   row.style.display = isHalted ? 'block' : 'none';
-  // While halted in manual mode, disable the normal controls (only Clear HALT).
   if (manualMode){
     const dis = isHalted;
-    ['btn-pump','btn-feed','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
+    ['btn-pump','btn-feed','btn-feedstop','btn-cal','pump-val','pump-unit','feed-val','feed-unit']
       .forEach(id=>{ const e=document.getElementById(id); if(e) e.disabled = dis; });
   }
 }
 
-function clearHalt(){
-  // Allowed in both modes: in auto it restarts a fresh cycle, in manual it
-  // returns to idle. The observer accepts clear_halt regardless of mode.
-  sendCmd('a=clear_halt');
-}
+function clearHalt(){ sendCmd('a=clear_halt'); }
 
 async function pollEvents(){
   try{
     const arr=await(await fetch('/events?last='+lastEvtId)).json();
     for(const e of arr){ if(e.id>lastEvtId){lastEvtId=e.id; addEvt(e);
       if(toastsArmed && (e.type==='halt'||e.type==='warn')) showToast(e.type, e.msg); } }
-    toastsArmed=true;   // only toast events that arrive AFTER the first load
+    toastsArmed=true;   // only toast events that arrive after the first load
   }catch(_){}
 }
 
-// Top-right pop-up notification. Red ('halt') for anomalies that stop the pump
-// (motor stall, dry-run); orange ('warn') for advisory ones (voltage, temp).
+// top-right toast: red 'halt' (pump stopped), orange 'warn' (advisory)
 function showToast(type, reason){
   const labels={
-    MOTOR_STALL:'Stallo motore — sistema in HALT',
-    DRY_RUN:'Funzionamento a secco — sistema in HALT',
-    VOLTAGE_DROP:'Tensione di alimentazione bassa',
-    TEMP_TOO_HIGH:'Temperatura troppo alta',
-    TEMP_TOO_LOW:'Temperatura troppo bassa',
-    DEGRADATION:'Degrado pompa — manutenzione consigliata'};
-  const title = type==='halt' ? 'HALT' : 'Attenzione';
-  const icon  = type==='halt' ? '⛔' : '⚠';
+    MOTOR_STALL:'Motor stall \u2014 system HALTED',
+    DRY_RUN:'Dry run \u2014 system HALTED',
+    VOLTAGE_DROP:'Supply voltage low',
+    TEMP_TOO_HIGH:'Temperature too high',
+    TEMP_TOO_LOW:'Temperature too low',
+    DEGRADATION:'Pump degradation \u2014 service recommended'};
+  const title = type==='halt' ? 'HALT' : 'Warning';
+  const icon  = type==='halt' ? '\u26d4' : '\u26a0';
   const msg   = labels[reason] || reason;
   const c=document.getElementById('toasts');
   const t=document.createElement('div');
@@ -493,13 +477,18 @@ function showToast(type, reason){
 }
 
 function startPolling(){
-  buildEvalBtns(); pollData(); pollEvents(); pollEval();
-  setInterval(pollData,  600);   // was 400 — reduces concurrent load on observer
-  setInterval(pollEvents,1500);  // was 700 — events are rarer, can poll slower
-  setInterval(pollEval,  1500);
+  pollData(); pollEvents();
+  setInterval(pollData,  600);
+  setInterval(pollEvents,1500);
+  // evaluation panel is developer-only: enabled with ?dev in the URL
+  if (DEV){
+    document.getElementById('evalpanel').style.display='';
+    buildEvalBtns(); pollEval();
+    setInterval(pollEval, 1500);
+  }
 }
 
-const EVAL_LABELS=['Normale','Stallo','Dry-run','Tensione','Temp alta','Temp bassa'];
+const EVAL_LABELS=['Normal','Stall','Dry-run','Voltage','Temp high','Temp low'];
 const EVAL_SHORT =['NOR','STA','DRY','VLT','T+','T-'];
 let evalTruth=-1;
 function buildEvalBtns(){
@@ -530,16 +519,16 @@ function renderEval(d){
   let tot=0,diag=0,fpRow=0,fpErr=0,fnRow=0,fnMiss=0;
   for(let i=0;i<T;i++)for(let j=0;j<T;j++){
     const v=m[i*T+j]; tot+=v; if(i===j)diag+=v;
-    if(i===0){ if(j!==0)fpErr+=v; fpRow+=v; }       // truth NORMAL → false positives
-    else { fnRow+=v; if(j===0)fnMiss+=v; }           // truth fault → missed (FN)
+    if(i===0){ if(j!==0)fpErr+=v; fpRow+=v; }       // truth NORMAL -> false positives
+    else { fnRow+=v; if(j===0)fnMiss+=v; }           // truth fault -> missed (FN)
   }
   const acc=tot?(100*diag/tot):0, fpr=fpRow?(100*fpErr/fpRow):0, fnr=fnRow?(100*fnMiss/fnRow):0;
   const st=document.getElementById('eval-stats');
-  const cur=(d.truth>=0)?('Verità attiva: <b>'+EVAL_LABELS[d.truth]+'</b>'):'Etichettatura disattivata';
-  st.innerHTML=cur+' · campioni: <b>'+d.count+'</b> · accuratezza: <b>'+acc.toFixed(0)+
-    '%</b> · falsi positivi: <b>'+fpr.toFixed(0)+'%</b> · falsi negativi: <b>'+fnr.toFixed(0)+
-    '%</b> · latenza media: <b>'+d.lat+' ms</b>';
-  let h='<tr><th>↓v r→</th>';
+  const cur=(d.truth>=0)?('Active truth: <b>'+EVAL_LABELS[d.truth]+'</b>'):'Labelling off';
+  st.innerHTML=cur+' &middot; samples: <b>'+d.count+'</b> &middot; accuracy: <b>'+acc.toFixed(0)+
+    '%</b> &middot; false positives: <b>'+fpr.toFixed(0)+'%</b> &middot; false negatives: <b>'+fnr.toFixed(0)+
+    '%</b> &middot; mean latency: <b>'+d.lat+' ms</b>';
+  let h='<tr><th>truth / det</th>';
   for(let j=0;j<T;j++) h+='<th>'+EVAL_SHORT[j]+'</th>';
   h+='</tr>';
   for(let i=0;i<T;i++){
@@ -561,19 +550,18 @@ function setConn(ok){
 }
 function addEvt(e){
   const list=document.getElementById('elist');
-  if(list.children.length===1 && list.children[0].querySelector('.ets')?.textContent==='—')
+  if(list.children.length===1 && list.children[0].querySelector('.ets')?.textContent==='\u2014')
     list.innerHTML='';
   const d=document.createElement('div');
   d.className='ei '+(e.type||'log');
   const s=Math.floor((Date.now()-e.ts)/1000);
-  const ago=s<2?'ora':s<60?s+'s fa':Math.floor(s/60)+'m fa';
+  const ago=s<2?'now':s<60?s+'s ago':Math.floor(s/60)+'m ago';
   d.innerHTML='<span class="ets">'+ago+'</span><span class="em">'+esc(e.msg)+'</span>';
   list.prepend(d);
   while(list.children.length>25) list.removeChild(list.lastChild);
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
-// Chart.js loaded via <script> tag in <head>; start once DOM+lib are ready
 if(window.Chart) boot();
 else window.addEventListener('load',()=>{ if(window.Chart) boot(); else setConn(false); });
 </script>

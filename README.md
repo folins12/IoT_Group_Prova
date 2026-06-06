@@ -1,210 +1,76 @@
 # FLOAT
-uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60};
-uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
 **Framework for Local Observation of Aquatic Tanks**
 
-FLOAT is an Edge IoT system designed to monitor and control aquatic tanks using low-power embedded devices.
-The system performs local monitoring, anomaly detection and actuator control without relying on cloud infrastructure.
+Edge-IoT system that runs an aquarium (water circulation + feeding) and, while it works, watches the pump's electrical signature to catch faults before they become failures. Fully autonomous on the local network; status and alarms also mirrored to the cloud.
 
-The goal of the project is to demonstrate how **edge devices can autonomously detect abnormal behaviors (e.g., pump stall)** and react in real-time while minimizing energy consumption.
-
----
-
-# System Architecture
-
-The system is composed of two ESP32 nodes communicating through **ESP-NOW**, a low-power connectionless wireless protocol.
-
-### Target Node
-
-The Target Node is responsible for:
-
-• Simulating turbidity sensing
-• Controlling the **water pump**
-• Controlling the **feeding servo motor**
-• Sending system logs and commands to the Observer Node
-
-### Observer Node
-
-The Observer Node performs monitoring and analysis:
-
-• Measures current consumption using an **INA219 power sensor**
-• Learns the normal behavior of the pump
-• Detects anomalies using a **statistical 3-Sigma rule**
-• Sends an **emergency HALT command** if abnormal current is detected
-
-Communication between the nodes is implemented using **ESP-NOW**, allowing direct device-to-device communication without WiFi infrastructure.
+Demo video: https://www.youtube.com/watch?v=Wky8BkITGp4
 
 ---
 
-# Edge AI Monitoring
+## Hardware
 
-The system implements a lightweight **statistical anomaly detection algorithm at the edge**.
+- **Target — ESP32-S3** · actuator + sensor node: drives pump, feeding servo, temperature probe.
+- **Observer — ESP32** · always-on brain + gateway: measures pump current, detects anomalies, serves the dashboard, bridges to the cloud.
+- **Arduino Uno** · dedicated front-end for the analog turbidity probe.
+- Peripherals: turbidity probe, **DS18B20** temperature, **water pump**, **feeding servo**, **INA219** current sensor, buzzer.
 
-During the **learning phase**, the Observer Node collects samples of the pump current consumption.
+## Connections
 
-The following values are computed:
+- **Arduino Uno ↔ Target** — UART (Uno TX→GPIO4, Uno RX→GPIO5), `'T'`/`'E'` handshake.
+- **DS18B20 → Target** — 1-Wire (GPIO7). **Pump** GPIO47, **Servo** GPIO6.
+- **INA219 → Observer** — I²C (SDA 41 / SCL 42); measures the Target's supply current. Buzzer GPIO7.
+- **Both ESP32 → WiFi hotspot** (STA); dashboard at the IP shown on boot (e.g. `http://172.20.10.5`).
+- MACs — Observer `F0:9E:9E:77:73:60` · Target `48:27:E2:E2:E3:0C`.
 
-μ = mean current
-σ = standard deviation
+## Communication
 
-The anomaly threshold is then calculated as:
+- **Target ↔ Observer → ESP-NOW** (not WiFi): connectionless, peer-to-peer, low-latency, low-power, no router needed. Messages: `LOG`, `DATA`, `CMD` (START_LEARN / START_MONITOR / STOP_MEASURE / HALT / mode / pump / feed / calibrate); ACK on critical commands. Both nodes auto-discover the hotspot's channel.
+- **Observer ↔ phone/PC → WiFi (HTTP):** the Observer hosts the live dashboard on the LAN.
+- **Observer ↔ cloud → MQTT over TLS** (HiveMQ Cloud, topics `float/aq1/...`): telemetry, retained device-shadow state, alerts, and remote commands. Plus **email alerts** on anomalies (Google Apps Script).
 
-Threshold = μ + 3σ
+## Security
 
-If the current exceeds the threshold for **three consecutive samples**, the system identifies a **mechanical stall** and immediately stops the pump.
+- **ESP-NOW encrypted** (AES-CCM, shared PMK + per-peer LMK) → no spoofed HALT/PUMP over the air.
+- **MQTT authenticated** (broker username/password) + **TLS encrypted**, with optional **server-certificate verification** (root CA pinned + NTP time) → MITM-proof cloud link.
+- **NVS safety latch** → pump stays halted across resets/brownouts until explicitly cleared.
 
-This approach enables **real-time fault detection without cloud processing**.
+## Sensing & actuation (what each is for)
 
----
+- **Turbidity** → selects the cycle action: circulate/filter (pump) vs. dispense food (servo).
+- **Temperature** → corrects the turbidity reading + triggers high/low temperature alarms.
+- **Pump** → water circulation/filtration. **Servo** → drops food.
+- **Pump current (INA219)** → the health signal used for anomaly detection.
 
-# Requirements and Metrics
+## Anomaly detection (at the edge)
 
-The system has been designed to satisfy the following requirements.
+- **Calibration:** learns the pump's normal current with **EWMA + Hampel** filter (rejects motor inrush) → baseline μ, σ.
+- **Detection** (confirmed over **3 consecutive samples**, after an inrush grace window):
+  - **MOTOR_STALL** (I > μ+3σ) → **immediate HALT**.
+  - **DRY_RUN** (I < 30% μ) → **immediate HALT**.
+  - **VOLTAGE_DROP**, **TEMP_TOO_HIGH/LOW** → warning only (pump keeps running).
+  - **DEGRADATION** (slow current creep, per-cycle CUSUM) → predictive "service soon" warning.
+- Reaction time ≈ **1.2 s** (3 × 400 ms).
 
-### Real-time Safety Reaction
+## Power
 
-Requirement
-Motor cutoff time < **2000 ms**
+- Target runs a short cycle, then **deep-sleeps ~20 s**; reduced WiFi TX power and brownout handling.
 
-Metric
-Measured reaction time ≈ **1200 ms**
+## What the user can do
 
-Explanation
-Three consecutive samples are collected every **400 ms**, producing a maximum detection latency of approximately **1.2 seconds**.
+**At home — local dashboard:**
+- live temperature / current / turbidity + pump-current chart with threshold lines;
+- **Default mode** ON (autonomous cycle) / OFF (manual bench);
+- manual controls (OFF only): run pump, dispense food, **stop feeding**, calibrate;
+- **Clear HALT** to recover after a stall/dry-run; live event log + anomaly pop-ups.
 
----
-
-### Power Monitoring Reliability
-
-Requirement
-Prevent false positives while detecting mechanical stalls.
-
-Metric
-Statistical threshold based on **3-Sigma rule (μ + 3σ)**.
-
-Explanation
-This method adapts the detection threshold to the real operating conditions of the pump.
-
----
-
-### Low Power Operation
-
-Requirement
-Maximize battery lifetime.
-
-Metric
-
-Duty Cycle:
-
-10 seconds active
-10 seconds deep sleep
-
-Additional energy optimizations:
-
-• WiFi TX power reduction
-• Deep Sleep mode
-• Brownout detector protection
+**Away — cloud:**
+- automatic **email** on every anomaly;
+- from the phone (IoT MQTT Panel) or the HiveMQ web client: **clear the alarm** and **restart the default cycle**.
 
 ---
 
-# Communication
+## Team
 
-The system uses **ESP-NOW**, which offers:
-
-• Connectionless communication
-• Very low latency
-• Low energy consumption
-
-Two message types are exchanged between nodes:
-
-LOG → status information
-CMD → system commands (START_LEARN, START_MONITOR, STOP_MEASURE, HALT)
-
----
-
-# Experiments
-
-Several experiments were performed to validate the system behavior.
-
-### Experiment 1 – Pump Current Learning
-
-Goal
-Determine the normal operating current of the pump.
-
-Procedure
-The pump runs for **10 seconds**, while the Observer Node collects current samples using the INA219 sensor.
-
-Result
-The system computes the mean current and standard deviation.
-
-Outcome
-The dynamic anomaly threshold is generated automatically using the **3-Sigma rule**.
-
----
-
-### Experiment 2 – Stall Detection
-
-Goal
-Verify that the system can detect abnormal motor behavior.
-
-Procedure
-Artificial high current conditions are simulated.
-
-Result
-The Observer Node detects three consecutive anomalies and sends a **HALT command**.
-
-Measured Reaction Time
-≈ **1200 ms**
-
-Outcome
-The system successfully stops the pump within the required time.
-
----
-
-### Experiment 3 – Energy Efficiency
-
-Goal
-Verify the energy optimization strategy.
-
-Procedure
-The device alternates between active operation and **Deep Sleep mode**.
-
-Configuration
-
-10 seconds active
-10 seconds sleep
-
-Outcome
-The duty cycle significantly reduces the average power consumption.
-
----
-
-# Demo Video
-
-Project demonstration video: https://www.youtube.com/watch?v=Wky8BkITGp4
-
-The video shows:
-
-• system architecture
-• learning phase
-• anomaly detection
-• automatic pump shutdown
-
----
-
-# Future Work
-
-Several improvements are planned for the final delivery.
-
-• Integration of a **real turbidity sensor**
-• Implementation of **IoT security mechanisms**
-• Improved power optimization strategies
-• Extended testing with real aquatic environments
-
----
-
-# Team Members
-
-Michele Libriani, 1954541 - www.linkedin.com/in/michele-libriani-805985316
-Andrea Folino, 1986019 - www.linkedin.com/in/andrea-folino-981aa5322
-Edoardo Zompanti, 1985499 - www.linkedin.com/in/edoardo-zompanti-a8678a3b4
+- Michele Libriani, 1954541 — www.linkedin.com/in/michele-libriani-805985316
+- Andrea Folino, 1986019 — www.linkedin.com/in/andrea-folino-981aa5322
+- Edoardo Zompanti, 1985499 — www.linkedin.com/in/edoardo-zompanti-a8678a3b4

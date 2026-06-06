@@ -1,19 +1,7 @@
-/*
- * FLOAT - Observer Node (v9)
- * ===========================
- * Reads motor current via INA219, detects anomalies using EWMA + Hampel filter,
- * and communicates with the Target node over ESP-NOW (channel 13).
- *
- * Anomaly policy:
- *   MOTOR_STALL  — pump halted immediately (10× HALT burst, system_locked)
- *   DRY_RUN      — pump halted immediately (no water in system)
- *   VOLTAGE_DROP — buzzer warning only; pump keeps running
- *                  (momentary voltage dip should not interrupt filtration)
- *   TEMP_TOO_HIGH/LOW — buzzer warning only; operator must act on heater/cooler
- *
- * Z-score removed: thresholds are absolute (μ±kσ from Hampel calibration),
- * no need to recompute it on every tick.
- */
+// FLOAT - Observer Node (ESP32)
+// Measures the Target's supply current with an INA219, detects anomalies (EWMA + Hampel),
+// serves the local dashboard, and bridges to the cloud over MQTT + email alerts.
+// Anomaly policy: MOTOR_STALL / DRY_RUN -> halt; VOLTAGE_DROP / TEMP_TOO_HIGH/LOW -> warning only.
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -22,49 +10,28 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp_now.h>
-#include <esp_wifi.h>  // Required for advanced radio control
+#include <esp_wifi.h>
 #include <math.h>
 #include "dashboard.h"
 
-// ── WiFi credentials ───────────────────────────────────────────────────────
-// Observer joins this network as STA so the dashboard is reachable at the IP
-// printed on serial at boot. The target also references this same SSID to
-// discover the channel — no dedicated AP needed. To switch networks (e.g.
-// home WiFi instead of hotspot) just edit these two constants in BOTH files
-// in sync. If the network is not found at boot the system falls back to the
-// hardcoded channel 13 used by the original v9 — ESP-NOW keeps working,
-// just without dashboard.
+// WiFi (edit in sync with target.cpp; fallback channel 13 if not found)
 const char* WIFI_SSID = "iPhone di Michele";
 const char* WIFI_PASS = "Michele4!";
 
-// ── MQTT / cloud bridge (Device-Shadow "reported" + Rules-Engine alerts) ───
-// The observer is the always-on WiFi STA, so it doubles as the MQTT client that
-// bridges FLOAT to a broker. It publishes telemetry, a retained "reported" state
-// (the device-shadow snapshot) and anomaly alerts (which a broker Rules Engine
-// can turn into Telegram/email). Remote commands ("desired") come in step 1b.
-// Broker-agnostic; the topic layout maps cleanly onto ThingsBoard / AWS IoT.
-// Set MQTT_ENABLED to 0 to compile the firmware without the cloud bridge (and
-// without needing the PubSubClient library).
+// MQTT cloud bridge (HiveMQ Cloud, private + authenticated, TLS)
 #define MQTT_ENABLED    1
-#define MQTT_TLS         1    // 1 = MQTT over TLS (encrypted link); 0 = plaintext
-#define MQTT_TLS_VERIFY  0    // 1 = also validate the broker certificate (needs NTP time +
-                             //     the broker root CA in MQTT_ROOT_CA below)
-                             // 0 = encrypt only, skip the server-cert check (quick test, any broker)
-// ── Cloud broker: HiveMQ Cloud Serverless (free, private, authenticated) ────
-// Create a free cluster at https://console.hivemq.cloud (no credit card), then
-// under "Access Management" add a username/password credential. Paste the
-// cluster URL and that credential below. Authentication closes the open-broker
-// hole: only clients with these credentials can publish/subscribe.
-#define MQTT_HOST      "cd328eb2e9234476a04403e82faba091.s1.eu.hivemq.cloud"  // your HiveMQ Cloud cluster URL
+#define MQTT_TLS         1    // 1 = TLS (encrypted); 0 = plaintext
+#define MQTT_TLS_VERIFY  1    // 1 = also validate the broker cert (needs NTP + MQTT_ROOT_CA); 0 = encrypt only
+#define MQTT_HOST      "cd328eb2e9234476a04403e82faba091.s1.eu.hivemq.cloud"
 #if MQTT_TLS
-  #define MQTT_PORT    8883                  // TLS port (HiveMQ Cloud requires TLS)
+  #define MQTT_PORT    8883
 #else
-  #define MQTT_PORT    1883                  // plaintext port (only for a local broker)
+  #define MQTT_PORT    1883
 #endif
-#define MQTT_USER      "Float_User" // credential created in HiveMQ Cloud
+#define MQTT_USER      "Float_User"
 #define MQTT_PASS      "Float1234"
 #define MQTT_CLIENT_ID "float-observer"
-#define MQTT_BASE      "float/aq1"           // topics: <base>/telemetry|state|alert|cmd
+#define MQTT_BASE      "float/aq1"           // <base>/telemetry | state | alert | cmd
 #if MQTT_ENABLED
   #include <PubSubClient.h>
   #if MQTT_TLS
@@ -72,13 +39,38 @@ const char* WIFI_PASS = "Michele4!";
     WiFiClientSecure mqttNet;
     #if MQTT_TLS_VERIFY
       #include <time.h>
-      // Broker root CA (PEM). Default target is Let's Encrypt ISRG Root X1, which
-      // backs broker.hivemq.com and many public brokers. If your broker uses a
-      // different CA, paste its root here (get it with:
-      //   openssl s_client -connect <host>:8883 -showcerts ).
+      // Broker root CA (PEM). HiveMQ Cloud uses Let's Encrypt ISRG Root X1.
       static const char* MQTT_ROOT_CA = R"CERT(
 -----BEGIN CERTIFICATE-----
-PASTE_BROKER_ROOT_CA_HERE
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )CERT";
     #endif
@@ -86,130 +78,100 @@ PASTE_BROKER_ROOT_CA_HERE
     WiFiClient mqttNet;
   #endif
   PubSubClient mqtt(mqttNet);
-  uint32_t     mqtt_last_pub = 0;            // last periodic publish
-  uint32_t     mqtt_last_try = 0;            // last (re)connect attempt
+  uint32_t     mqtt_last_pub = 0;
+  uint32_t     mqtt_last_try = 0;
 #endif
 
-// ── Email alerts on anomalies (free, via a Google Apps Script web app) ──────
-// IFTTT Webhooks is no longer free, so we use Google Apps Script (free with any
-// Google account): a tiny script with MailApp.sendEmail, deployed as a Web App
-// ("Execute as: Me", "Who has access: Anyone"). Paste its /exec URL below; the
-// device GETs it with ?reason=&severity=&v= and the script emails you.
+// Email alerts via a free Google Apps Script web app (HTTPS GET with ?reason=&severity=&v=)
 #define EMAIL_ALERTS_ENABLED 1
-#define EMAIL_WEBHOOK_URL "https://script.google.com/macros/s/AKfycbwqgXFfeVU0x2Wg0LbV6Y3OX_cs2e2xW5ThtuZp2KUCADMGFY1AHphpS_XoToIrBsl9/exec"
+#define EMAIL_WEBHOOK_URL "https://script.google.com/macros/s/AKfycbyJJLdBmr7H1WGy-DhsXkxaTLGi_KEOzmZNDy5yu_Lrdq13BcbJ_TE9X9nILWsZYLVF/exec"
 #if EMAIL_ALERTS_ENABLED
   #include <WiFiClientSecure.h>
   #include <HTTPClient.h>
 #endif
 
-// ── Default-mode (dashboard toggle) ────────────────────────────────────────
-// autoMode = true  → the predefined cycle (learning → sleep → pump/feeding →
-//                    sleep → …) runs autonomously, exactly as in v9.
-// autoMode = false → the cycle is suspended; system sits in IDLE awaiting
-//                    explicit commands from the dashboard (buttons TBD).
-// The state is persisted in NVS (survives any reset). When the user toggles
-// OFF→ON the Observer resets its own state AND tells the target to wipe its
-// own counters so the next cycle starts fresh from learning.
+// Default-mode toggle (persisted in NVS). ON = autonomous cycle, OFF = manual bench.
 Preferences   obsPrefs;
 bool          autoMode            = true;
-const char*   pendingTargetCmd    = nullptr;   // ESP-NOW string to forward
-int           pendingTargetCount  = 0;          // send N times for reliability
-bool          targetPumpOn        = false;     // last pump state from idle heartbeat
-bool          targetHalted        = false;     // last halt state from idle heartbeat
+const char*   pendingTargetCmd    = nullptr;   // ESP-NOW string to forward to the target
+int           pendingTargetCount  = 0;
+bool          targetPumpOn        = false;
+bool          targetHalted        = false;
 
-// ── Pin map ────────────────────────────────────────────────────────────────
+// Pins
 const int I2C_SDA     = 41;
 const int I2C_SCL     = 42;
 const int BUZZER_PIN  = 7;
 
-// ── Hardware ───────────────────────────────────────────────────────────────
 Adafruit_INA219 ina219;
-WebServer       server(80);   // HTTP server for the dashboard
+WebServer       server(80);
 
-// ── ESP-NOW peer (Target node MAC address) ────────────────────────────────
+// ESP-NOW peer (Target MAC) + AES-CCM keys (must match target.cpp byte-for-byte)
 uint8_t targetAddress[] = {0x48, 0x27, 0xE2, 0xE2, 0xE3, 0x0C};
-
-// ESP-NOW link encryption (AES-CCM). MUST match target.cpp byte-for-byte.
 static const uint8_t ESPNOW_PMK[16] = {'F','L','O','A','T','-','p','m','k','-','v','9','-','a','q','1'};
 static const uint8_t ESPNOW_LMK[16] = {'F','L','O','A','T','-','l','m','k','-','v','9','-','a','q','1'};
 
-// ── System state ───────────────────────────────────────────────────────────
+// System state
 String  current_mode   = "IDLE";    // IDLE | LEARNING | MONITORING
 bool    system_locked  = false;
 String  anomaly_reason = "NONE";
-String   last_anomaly_pushed = "NONE";  // de-duplicate dashboard toast events
+String   last_anomaly_pushed = "NONE";
 uint32_t last_anomaly_push_ms = 0;
 
-// ── Learning / calibration ─────────────────────────────────────────────────
+// Learning / calibration
 const int  MAX_SAMPLES = 60;
-float      samples[MAX_SAMPLES];       // current samples (mA)
-float      temp_samples[MAX_SAMPLES];  // temperature samples (°C) — independent counter
-int        sample_idx      = 0;        // current sample count
-int        temp_sample_idx = 0;        // temperature sample count (independent from current)
+float      samples[MAX_SAMPLES];
+float      temp_samples[MAX_SAMPLES];
+int        sample_idx      = 0;
+int        temp_sample_idx = 0;
 int        grace_period    = 0;
 
 float baseline_mean      = 0.0f;
 float baseline_std       = 0.0f;
-float th_stall           = 0.0f;   // stall threshold:   μ_I + 3σ_I
-float th_volt_min        = 0.0f;   // minimum healthy bus voltage (90 % of calib voltage)
-float th_dry_run         = 0.0f;   // dry-run threshold: 30 % of baseline mean current
+float th_stall           = 0.0f;   // mu + 3*sigma
+float th_volt_min        = 0.0f;   // 90% of calibration voltage
+float th_dry_run         = 0.0f;   // 30% of mu
 bool  is_calibrated      = false;
-bool  calFromManual      = false;   // true if current calibration came from a
-                                    // manual Calibrate (OFF mode). Decides whether
-                                    // OFF→ON keeps the baseline (boot 1) or relearns
-                                    // (boot 0), and survives only until ON→OFF.
-bool  new_temp_for_learn = false;  // set by DATA:SENSOR callback to trigger a combined I+V+T print
+bool  calFromManual      = false;
+bool  new_temp_for_learn = false;
 
-// ── Dynamic temperature thresholds ────────────────────────────────────────
-const float TEMP_K_SIGMA      =  5.0f;  // anomaly multiplier on natural σ
-const float TEMP_DELTA_MIN    =  1.5f;  // min deviation to trigger alarm (°C)
-const float TEMP_ABSOLUTE_MAX = 32.0f;  // absolute backstop high
-const float TEMP_ABSOLUTE_MIN = 16.0f;  // absolute backstop low
+// Dynamic temperature thresholds
+const float TEMP_K_SIGMA      =  5.0f;
+const float TEMP_DELTA_MIN    =  1.5f;
+const float TEMP_ABSOLUTE_MAX = 32.0f;
+const float TEMP_ABSOLUTE_MIN = 16.0f;
+float th_temp_high = TEMP_ABSOLUTE_MAX;
+float th_temp_low  = TEMP_ABSOLUTE_MIN;
 
-float th_temp_high = TEMP_ABSOLUTE_MAX;  // updated after calibration
-float th_temp_low  = TEMP_ABSOLUTE_MIN;  // updated after calibration
-
-// ── EWMA state ─────────────────────────────────────────────────────────────
+// EWMA
 const float EWMA_ALPHA   = 0.2f;
 float       ewma_current = 0.0f;
 bool        ewma_init    = false;
 
-// ── Anomaly confirmation counters (Separated to prevent crosstalk) ─────────
+// Anomaly confirmation counters
 int stall_confirm = 0;
 int dry_confirm   = 0;
 int volt_confirm  = 0;
 int temp_confirm  = 0;
 const int CONFIRM_NEEDED = 3;
 
-// ── Predictive degradation (per-cycle CUSUM on healthy operating current) ──
-// Each monitored cycle yields a mean "healthy" current (stall/dry samples
-// excluded). We accumulate, via a one-sided CUSUM, how much that per-cycle
-// mean sits ABOVE the learned baseline μ beyond a tolerance band. A sustained
-// upward creep (impeller fouling, bearing friction) pushes the CUSUM past a
-// limit and raises a DEGRADATION warning — a heads-up to service the pump
-// BEFORE a hard stall, which a single-sample μ+3σ test cannot anticipate.
-// Tolerance and limit are expressed in σ so they scale with baseline noise.
-const float DRIFT_K_SIGMA = 1.0f;   // allowance: ignore drift under μ + 1σ
-const float DRIFT_H_SIGMA = 3.0f;   // fire after this many σ accumulate
-float drift_cusum     = 0.0f;       // one-sided cumulative sum (mA·cycles)
-float drift_cycle_sum = 0.0f;       // Σ healthy ewma_current in current cycle
-int   drift_cycle_n   = 0;          // count of healthy samples in current cycle
+// Predictive degradation: one-sided CUSUM on the per-cycle healthy current vs baseline
+const float DRIFT_K_SIGMA = 1.0f;   // tolerance band (sigma)
+const float DRIFT_H_SIGMA = 3.0f;   // fire after this many sigma accumulate
+float drift_cusum     = 0.0f;
+float drift_cycle_sum = 0.0f;
+int   drift_cycle_n   = 0;
 
-// ── Evaluation harness (labelled confusion matrix + detection latency) ─────
-// Lets us quantify detector quality with ground-truth labels set from the
-// dashboard. Classes: 0 NORMAL, 1 MOTOR_STALL, 2 DRY_RUN, 3 VOLTAGE_DROP,
-// 4 TEMP_TOO_HIGH, 5 TEMP_TOO_LOW. For each monitored cycle we record one
-// outcome: confmat[truth][detected]++. From the matrix the dashboard derives
-// accuracy, false-positive rate, false-negative rate and per-class recall.
-// Latency = time from the first raw out-of-range sample to ANOMALY CONFIRMED.
+// Evaluation harness: labelled confusion matrix + detection latency.
+// Classes: 0 NORMAL, 1 MOTOR_STALL, 2 DRY_RUN, 3 VOLTAGE_DROP, 4 TEMP_TOO_HIGH, 5 TEMP_TOO_LOW.
 const int EVAL_CLASSES = 6;
 int      confmat[EVAL_CLASSES][EVAL_CLASSES] = {{0}};
-int      eval_truth         = -1;       // -1 = evaluation off; else 0..5
-int      eval_count         = 0;        // total recorded cycles
-float    eval_lat_sum       = 0.0f;     // Σ detection latency (ms)
-int      eval_lat_n         = 0;        // number of latency samples
-bool     eval_cycle_recorded = false;   // one record per cycle
-uint32_t eval_onset_ms      = 0;        // first raw-abnormal sample this cycle
+int      eval_truth         = -1;       // -1 = off; else 0..5
+int      eval_count         = 0;
+float    eval_lat_sum       = 0.0f;
+int      eval_lat_n         = 0;
+bool     eval_cycle_recorded = false;
+uint32_t eval_onset_ms      = 0;
 
 int reasonToClass(const String& r) {
     if (r == "MOTOR_STALL")   return 1;
@@ -220,16 +182,13 @@ int reasonToClass(const String& r) {
     return 0;
 }
 
-// ── Latest sensor readings (forwarded to dashboard node) ──────────────────
+// Latest sensor readings
 float last_current  = 0.0f;
 float last_voltage  = 0.0f;
-float last_temp_c   = 25.0f;  // default; updated from Target DATA:SENSOR messages
-float last_turb     = 0.0f;   // turbidity for dashboard (parsed from DATA:SENSOR)
+float last_temp_c   = 25.0f;
+float last_turb     = 0.0f;
 
-// ── Event ring buffer for the dashboard ───────────────────────────────────
-// Fixed char[] buffer, no heap/String — safe to write from inside the
-// ESP-NOW receive callback. portMUX_TYPE guards inter-core access between
-// the WiFi task (which runs the callback) and the main loop.
+// Event ring buffer for the dashboard (fixed buffer, callback-safe)
 struct EvtEntry { uint32_t id; uint32_t ts; char type[14]; char msg[116]; };
 const int EVT_MAX = 40;
 EvtEntry  evt_buf[EVT_MAX];
@@ -250,7 +209,6 @@ void push_event(const char* type, const char* msg) {
     portEXIT_CRITICAL(&evt_mux);
 }
 
-// Classify Target LOG lines into dashboard categories by keyword.
 void push_log_event(const char* txt) {
     const char* type = "log";
     if (strstr(txt, "[WARN]") || strstr(txt, "[HALT]") || strstr(txt, "[CRITICAL]"))
@@ -258,19 +216,16 @@ void push_log_event(const char* txt) {
     push_event(type, txt);
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
+// Stats helpers
 void computeStats(float* arr, int n, float& mean, float& std_dev) {
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += arr[i];
     mean = sum / n;
-
     float sq = 0.0f;
     for (int i = 0; i < n; i++) sq += powf(arr[i] - mean, 2);
     std_dev = sqrtf(sq / n);
 }
 
-// ── Hampel filter (replaces robustStats) ──────────────────────────────────
 float arrayMedian(float* arr, int n) {
     float buf[n];
     memcpy(buf, arr, n * sizeof(float));
@@ -282,18 +237,15 @@ float arrayMedian(float* arr, int n) {
     return (n % 2 == 0) ? (buf[n/2-1] + buf[n/2]) / 2.0f : buf[n/2];
 }
 
+// Hampel filter: robust mean/std (rejects outliers via MAD)
 void hampelStats(float* arr, int n, float k_sigma,
                  float& clean_mean, float& clean_std) {
     if (n < 3) { computeStats(arr, n, clean_mean, clean_std); return; }
-
     float med = arrayMedian(arr, n);
-
     float devs[n];
     for (int i = 0; i < n; i++) devs[i] = fabsf(arr[i] - med);
-
     float mad     = arrayMedian(devs, n);
-    float sigma_h = 1.4826f * mad;   
-
+    float sigma_h = 1.4826f * mad;
     float sum = 0.0f; float sq = 0.0f; int cnt = 0;
     for (int i = 0; i < n; i++) {
         if (sigma_h < 1e-6f || fabsf(arr[i] - med) <= k_sigma * sigma_h) {
@@ -321,13 +273,12 @@ void buzzerAlert(int times) {
 }
 
 #if MQTT_ENABLED
-// Forward declarations: MQTT "desired" commands reuse the exact same logic as
-// the HTTP handlers (single source of truth for mode transition / halt clear).
+// Forward decls: MQTT commands reuse the same logic as the HTTP handlers (single source of truth)
 void applyMode(bool on);
 void applyClearHalt();
-bool applyManualCmd(const String& a, long sec);   // pump/feed/calibrate, shared HTTP+MQTT
-// ── MQTT cloud bridge ──────────────────────────────────────────────────────
-// Time-series telemetry → <base>/telemetry
+bool applyManualCmd(const String& a, long sec);
+
+// MQTT publish: telemetry
 void mqttPublishTelemetry() {
     if (!mqtt.connected()) return;
     char buf[200];
@@ -337,9 +288,7 @@ void mqttPublishTelemetry() {
     mqtt.publish(MQTT_BASE "/telemetry", buf);
 }
 
-// Retained "reported" device state → <base>/state. Retain means a freshly
-// connected subscriber (or the cloud after a restart) immediately gets the last
-// known mode/halt/calibration/thresholds — the device-shadow snapshot.
+// MQTT publish: retained reported state (device-shadow snapshot)
 void mqttPublishState() {
     if (!mqtt.connected()) return;
     char buf[256];
@@ -351,11 +300,10 @@ void mqttPublishState() {
         system_locked ? "true" : "false",
         is_calibrated ? "true" : "false",
         baseline_mean, th_stall, th_dry_run, drift_cusum);
-    mqtt.publish(MQTT_BASE "/state", buf, true);   // retained
+    mqtt.publish(MQTT_BASE "/state", buf, true);
 }
 
-// Anomaly alert → <base>/alert (a broker Rules Engine routes this to a
-// notification, e.g. Telegram/email). Severity mirrors the dashboard toast.
+// MQTT publish: anomaly alert
 void mqttPublishAlert(const char* reason, const char* severity) {
     if (!mqtt.connected()) return;
     char buf[176];
@@ -365,9 +313,7 @@ void mqttPublishAlert(const char* reason, const char* severity) {
     mqtt.publish(MQTT_BASE "/alert", buf);
 }
 
-// Non-blocking keepalive. Reconnects at most every 5 s and never stalls the
-// dashboard or ESP-NOW if the broker is unreachable. Publishes telemetry+state
-// on a 5 s cadence once connected.
+// Non-blocking keepalive: reconnect <=5 s, publish telemetry+state every 5 s
 void mqttTask() {
     if (WiFi.status() != WL_CONNECTED) return;
     if (!mqtt.connected()) {
@@ -385,10 +331,10 @@ void mqttTask() {
                 : mqtt.connect(MQTT_CLIENT_ID);
         if (ok) {
             Serial.println("[MQTT] connected");
-            mqtt.subscribe(MQTT_BASE "/cmd");   // listen for desired-state commands
-            mqttPublishState();           // push reported state on (re)connect
+            mqtt.subscribe(MQTT_BASE "/cmd");
+            mqttPublishState();
         } else {
-            Serial.printf("[MQTT] connect failed (rc=%d) — will retry\n", mqtt.state());
+            Serial.printf("[MQTT] connect failed (rc=%d) - will retry\n", mqtt.state());
             return;
         }
     }
@@ -401,11 +347,8 @@ void mqttTask() {
     }
 }
 
-// Incoming "desired" command on <base>/cmd. Full remote control, mirroring the
-// dashboard. Always allowed: mode_on | mode_off | clear_halt. Allowed only when
-// the automatic cycle is OFF (same gate as the dashboard): pump_on[:sec] |
-// pump_off | feed[:sec] | calibrate. After applying, state is republished so
-// the shadow's reported side converges with the desired command.
+// Incoming command on <base>/cmd. Always allowed: mode_on | mode_off | clear_halt.
+// OFF-mode only (same gate as the dashboard): pump_on[:sec] | pump_off | feed[:sec] | feed_stop | calibrate.
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
     char msg[24];
     unsigned int n = (len < sizeof(msg) - 1) ? len : sizeof(msg) - 1;
@@ -415,35 +358,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
     String c = String(msg); c.toLowerCase();
     Serial.printf("[MQTT] cmd received: '%s'\n", c.c_str());
 
-    // Mode + halt clear: valid in any mode.
     if      (c == "mode_on"    || c == "mode:on"  || c == "on")  { applyMode(true);  mqttPublishState(); return; }
     else if (c == "mode_off"   || c == "mode:off" || c == "off") { applyMode(false); mqttPublishState(); return; }
     else if (c == "clear_halt" || c == "clearhalt")              { applyClearHalt(); mqttPublishState(); return; }
 
-    // Manual actuator commands: parse optional duration ("pump_on:10", "feed:5").
     String act = c; long sec = 0;
     int colon = c.indexOf(':');
     if (colon > 0) { act = c.substring(0, colon); sec = c.substring(colon + 1).toInt(); }
 
-    if (autoMode) {   // same safety gate as the dashboard
+    if (autoMode) {
         Serial.println("[MQTT] ignored: auto mode on (manual control only in OFF)");
         return;
     }
     if (applyManualCmd(act, sec)) mqttPublishState();
-    else Serial.println("[MQTT] unknown command — ignored");
+    else Serial.println("[MQTT] unknown command - ignored");
 }
 #endif
 
 #if EMAIL_ALERTS_ENABLED
-// Send an email on an anomaly via a free Google Apps Script web app (one short
-// HTTPS GET). To stay within RAM on the plain ESP32, the MQTT TLS session is
-// dropped for the duration of the call (the alert has already been published to
-// the broker by this point) and reconnects on the next loop. Failure is non-fatal.
+// Email on anomaly via Apps Script (HTTPS GET). MQTT TLS is dropped during the call to free RAM.
 void sendEmailAlert(const char* reason, const char* severity) {
     if (WiFi.status() != WL_CONNECTED) return;
-    if (strncmp(EMAIL_WEBHOOK_URL, "PASTE", 5) == 0) return;   // not configured yet
+    if (strncmp(EMAIL_WEBHOOK_URL, "PASTE", 5) == 0) return;
 #if MQTT_ENABLED
-    if (mqtt.connected()) mqtt.disconnect();           // free the TLS context
+    if (mqtt.connected()) mqtt.disconnect();
 #endif
     {
         WiFiClientSecure cli;
@@ -454,9 +392,9 @@ void sendEmailAlert(const char* reason, const char* severity) {
             "%s?reason=%s&severity=%s&v=%.2f",
             EMAIL_WEBHOOK_URL, reason, severity, last_voltage);
         if (https.begin(cli, url)) {
-            https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);  // Apps Script 302s to googleusercontent.com
+            https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
             https.setConnectTimeout(5000);
-            https.setTimeout(8000);                                  // script cold-start can be slow
+            https.setTimeout(8000);
             int code = https.GET();
             Serial.printf("[EMAIL] webhook -> %d\n", code);
             https.end();
@@ -465,38 +403,24 @@ void sendEmailAlert(const char* reason, const char* severity) {
         }
     }
 #if MQTT_ENABLED
-    mqtt_last_try = 0;   // reconnect MQTT immediately on the next loop
+    mqtt_last_try = 0;
 #endif
 }
 #endif
 
-// ── ESP-NOW receive callback ───────────────────────────────────────────────
+// ESP-NOW receive callback (messages from the Target)
 void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     char msg[len + 1];
     memcpy(msg, data, len);
     msg[len] = '\0';
     String s(msg);
 
-    // ── HALT echo (safety net) ───────────────────────────────────────────
-    // If we're locked we keep telling the target so on every single message
-    // it sends us. This covers the scenario in which the original HALT
-    // (sent right at stall confirmation) was lost because of the voltage
-    // sag / radio drop caused by the stall itself. On any subsequent target
-    // boot, the very first message (a [BOOT] log) triggers this echo and
-    // the target sets its NVS halted flag, going back to sleep at the next
-    // gate in setup(). The check is BEFORE the pending-cmd block because
-    // an AUTO_ON_RESET (which clears system_locked first) must not be
-    // shadowed by a stale HALT.
+    // HALT echo: if locked, re-assert HALT on every message (covers a lost original HALT)
     if (system_locked) {
         esp_now_send(mac, (const uint8_t*)"HALT", 4);
     }
 
-    // ── Piggy-back pending default-mode command to the target ────────────
-    // When the dashboard toggle changes, we don't know when the target will
-    // be awake. Instead of polling, we ride along on any message the target
-    // sends us and reply with the current state command. pendingTargetCount
-    // (default 5) ensures we keep sending for several incoming messages so
-    // at least one reliably reaches the target.
+    // Piggy-back a pending default-mode command on any incoming message
     if (pendingTargetCmd != nullptr && pendingTargetCount > 0) {
         esp_now_send(mac, (const uint8_t*)pendingTargetCmd, strlen(pendingTargetCmd));
         pendingTargetCount--;
@@ -506,30 +430,17 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     int id_pos = s.indexOf("|ID:");
     if (id_pos != -1) {
         uint32_t msg_id = (uint32_t)s.substring(id_pos + 4).toInt();
-        s = s.substring(0, id_pos);   
+        s = s.substring(0, id_pos);
         char ack_buf[32];
         snprintf(ack_buf, sizeof(ack_buf), "ACK:%lu", (unsigned long)msg_id);
         esp_now_send(mac, (const uint8_t*)ack_buf, strlen(ack_buf));
     }
 
     if (s.startsWith("HB:")) {
-        // Idle heartbeat from a target paused in default-mode OFF. Payload is
-        // two digits "<pump><halt>": pump state then halt state ("HB:00" idle,
-        // "HB:10" pumping, "HB:01" halted). Three jobs:
-        //  1) reconcile desired vs actual — if the dashboard wants ON but the
-        //     target is still OFF, push AUTO_ON_RESET so it reboots into a
-        //     fresh cycle (makes OFF→ON work while idle, and re-syncs after a
-        //     physical reset when the transient pendingTargetCmd was lost);
-        //  2) record pump state so /data lights the dashboard pump control;
-        //  3) record target-side halt so the dashboard can show "Clear HALT"
-        //     even when this Observer was reset and lost its own lock.
+        // Idle heartbeat "<pump><halt>": reconcile OFF->ON, light pump control, surface target halt
         targetPumpOn   = (s.length() > 3 && s.charAt(3) == '1');
         targetHalted   = (s.length() > 4 && s.charAt(4) == '1');
         if (autoMode && !targetHalted) {
-            // Bring the idle target online with a fresh learning cycle
-            // (AUTO_ON_RESET → boot 0). Skipped while the target is halted: it
-            // stays awake to be recovered with Clear HALT and must not be
-            // restarted out from under the halt.
             const char* cmd = "CMD:AUTO_ON_RESET";
             esp_now_send(mac, (const uint8_t*)cmd, strlen(cmd));
         }
@@ -539,7 +450,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     if (s.startsWith("LOG:")) {
         String log_text = s.substring(4);
         Serial.println(log_text);
-        push_log_event(log_text.c_str());   // forward to dashboard
+        push_log_event(log_text.c_str());
 
     } else if (s.startsWith("DATA:SENSOR:")) {
         String payload    = s.substring(12);
@@ -552,10 +463,10 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
                 last_temp_c = received_temp;
                 if (current_mode == "LEARNING" && temp_sample_idx < MAX_SAMPLES) {
                     temp_samples[temp_sample_idx++] = received_temp;
-                    new_temp_for_learn = true;   
+                    new_temp_for_learn = true;
                 }
             } else {
-                Serial.printf("[OBS] WARNING: invalid temperature %.1f °C received — keeping last valid: %.1f °C\n",
+                Serial.printf("[OBS] WARNING: invalid temperature %.1f C - keeping last valid: %.1f C\n",
                               received_temp, last_temp_c);
             }
         }
@@ -567,31 +478,43 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         ewma_init            = false;
         new_temp_for_learn   = false;
         memset(temp_samples, 0, sizeof(temp_samples));
-        // Remember who triggered this learn: a manual Calibrate (autoMode=false)
-        // produces a baseline that should survive the next OFF→ON; the automatic
-        // first-boot learn (autoMode=true) does not.
         calFromManual        = !autoMode;
-        Serial.println("[OBS] MODE → LEARNING");
-        push_event("phase", "LEARNING — calibrating pump baseline");
+        Serial.println("[OBS] MODE -> LEARNING");
+        push_event("phase", "LEARNING - calibrating pump baseline");
 
     } else if (s == "CMD:START_MONITOR") {
         if (!is_calibrated) {
-            Serial.println("[OBS] WARNING: not calibrated yet — monitoring skipped");
+            // Not calibrated. In auto mode this means a desync (e.g. a remote
+            // OFF->ON wiped calibration while the target was asleep, so the
+            // target never relearned). Self-heal: learn from THIS pump cycle
+            // instead of skipping monitoring forever. In OFF mode keep the
+            // skip + warning (the user must press Calibrate first).
+            if (autoMode) {
+                current_mode       = "LEARNING";
+                sample_idx         = 0;
+                temp_sample_idx    = 0;
+                ewma_init          = false;
+                new_temp_for_learn = false;
+                memset(temp_samples, 0, sizeof(temp_samples));
+                calFromManual      = false;
+                Serial.println("[OBS] not calibrated -> learning from this cycle");
+                push_event("phase", "LEARNING - calibrating from current cycle");
+            } else {
+                Serial.println("[OBS] WARNING: not calibrated yet - monitoring skipped");
+            }
             return;
         }
         current_mode    = "MONITORING";
-        
         stall_confirm = 0;
         dry_confirm   = 0;
         volt_confirm  = 0;
         temp_confirm  = 0;
-
-        ewma_init       = false;  
+        ewma_init       = false;
         grace_period    = 4;
-        eval_cycle_recorded = false;   // new monitored cycle → arm one eval record
+        eval_cycle_recorded = false;
         eval_onset_ms       = 0;
-        Serial.println("[OBS] MODE → MONITORING");
-        push_event("phase", "MONITORING — anomaly detection active");
+        Serial.println("[OBS] MODE -> MONITORING");
+        push_event("phase", "MONITORING - anomaly detection active");
 
     } else if (s == "CMD:STOP_MEASURE") {
         if (current_mode == "LEARNING" && sample_idx > 5) {
@@ -608,44 +531,33 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             if (temp_sample_idx >= 3) {
                 float temp_mean, temp_std;
                 hampelStats(temp_samples, temp_sample_idx, 3.0f, temp_mean, temp_std);
-
                 float delta     = max(TEMP_K_SIGMA * temp_std, TEMP_DELTA_MIN);
                 float cand_high = temp_mean + delta;
                 float cand_low  = temp_mean - delta;
-
                 th_temp_high = min(cand_high, TEMP_ABSOLUTE_MAX);
                 th_temp_low  = max(cand_low,  TEMP_ABSOLUTE_MIN);
 
-                Serial.println("\n[OBS] ── Temperature baseline ──");
+                Serial.println("\n[OBS] -- Temperature baseline --");
                 Serial.printf("   Temp samples : %d\n",         temp_sample_idx);
-                Serial.printf("   Temp mean    : %.2f °C\n",    temp_mean);
-                Serial.printf("   Temp std (σ) : %.2f °C\n",    temp_std);
-                Serial.printf("   Delta used   : %.2f °C  (max(%.0f×σ=%.2f, min=%.1f))\n",
-                              delta, TEMP_K_SIGMA, TEMP_K_SIGMA * temp_std, TEMP_DELTA_MIN);
-                Serial.printf("   Alarm HIGH   : %.2f °C  (μ+delta=%.2f, backstop=%.0f)\n",
-                              th_temp_high, cand_high, TEMP_ABSOLUTE_MAX);
-                Serial.printf("   Alarm LOW    : %.2f °C  (μ-delta=%.2f, backstop=%.0f)\n",
-                              th_temp_low,  cand_low,  TEMP_ABSOLUTE_MIN);
+                Serial.printf("   Temp mean    : %.2f C\n",     temp_mean);
+                Serial.printf("   Temp std     : %.2f C\n",     temp_std);
+                Serial.printf("   Alarm HIGH   : %.2f C\n",     th_temp_high);
+                Serial.printf("   Alarm LOW    : %.2f C\n",     th_temp_low);
             } else {
                 th_temp_high = TEMP_ABSOLUTE_MAX;
                 th_temp_low  = TEMP_ABSOLUTE_MIN;
-                Serial.printf("[OBS] WARNING: only %d temperature samples — using backstop limits (%.0f / %.0f °C)\n",
-                              temp_sample_idx, TEMP_ABSOLUTE_MAX, TEMP_ABSOLUTE_MIN);
+                Serial.printf("[OBS] WARNING: only %d temp samples - using backstop limits\n", temp_sample_idx);
             }
 
             is_calibrated = true;
-            drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;  // new μ → restart drift
+            drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
 
-            Serial.println("\n[OBS] ══ Calibration complete (EWMA + Hampel) ══");
-            Serial.printf("   Current samples : %d\n",               sample_idx);
-            Serial.printf("   Temp samples    : %d\n",               temp_sample_idx);
-            Serial.printf("   mean (μ)        : %.2f mA\n",          baseline_mean);
-            Serial.printf("   std  (σ)        : %.2f mA\n",          baseline_std);
-            Serial.printf("   Stall thr       : %.2f mA  (μ + 3σ)\n", th_stall);
-            Serial.printf("   Dry-run         : %.2f mA  (30%% μ)\n",  th_dry_run);
-            Serial.printf("   Volt min        : %.2f V\n",            th_volt_min);
-            Serial.printf("   Temp alarm ↑    : %.2f °C\n",           th_temp_high);
-            Serial.printf("   Temp alarm ↓    : %.2f °C\n",           th_temp_low);
+            Serial.println("\n[OBS] == Calibration complete (EWMA + Hampel) ==");
+            Serial.printf("   mean (mu)  : %.2f mA\n",          baseline_mean);
+            Serial.printf("   std (sigma): %.2f mA\n",          baseline_std);
+            Serial.printf("   Stall thr  : %.2f mA  (mu+3sigma)\n", th_stall);
+            Serial.printf("   Dry-run    : %.2f mA  (30%% mu)\n",  th_dry_run);
+            Serial.printf("   Volt min   : %.2f V\n",            th_volt_min);
 
             char buf[200];
             snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
@@ -655,26 +567,24 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
             char notif[120];
             snprintf(notif, sizeof(notif),
-                     "Calibration done — μ=%.1f mA  stall=%.1f  T[%.1f-%.1f]°C",
+                     "Calibration done - mu=%.1f mA  stall=%.1f  T[%.1f-%.1f]C",
                      baseline_mean, th_stall, th_temp_low, th_temp_high);
             push_event("calibration", notif);
         }
 
-        // End of a MONITORING cycle: fold this cycle's healthy mean into the
-        // degradation CUSUM. Skipped after a learning cycle (no drift data) and
-        // when the cycle was halted (system_locked) or too short to be reliable.
+        // End of a MONITORING cycle: fold healthy mean into the degradation CUSUM
         if (current_mode == "MONITORING" && is_calibrated &&
             !system_locked && drift_cycle_n >= 4 && baseline_mean > 1.0f) {
             float cycle_mean = drift_cycle_sum / drift_cycle_n;
             float k = DRIFT_K_SIGMA * baseline_std;
-            float dev = (cycle_mean - baseline_mean) - k;        // beyond tolerance
+            float dev = (cycle_mean - baseline_mean) - k;
             drift_cusum += dev; if (drift_cusum < 0.0f) drift_cusum = 0.0f;
             float limit = DRIFT_H_SIGMA * baseline_std;
-            Serial.printf("[DRIFT] cycle μ=%.1f mA (baseline %.1f, +%.1f)  CUSUM=%.1f / %.1f\n",
+            Serial.printf("[DRIFT] cycle mu=%.1f mA (baseline %.1f, +%.1f)  CUSUM=%.1f / %.1f\n",
                           cycle_mean, baseline_mean, cycle_mean - baseline_mean,
                           drift_cusum, limit);
             if (drift_cusum > limit) {
-                Serial.println("[WARN] DEGRADATION: pump current creeping up — service recommended.");
+                Serial.println("[WARN] DEGRADATION: pump current creeping up - service recommended.");
                 push_event("warn", "DEGRADATION");
                 buzzerAlert(2);
 #if MQTT_ENABLED
@@ -683,14 +593,12 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
 #if EMAIL_ALERTS_ENABLED
                 sendEmailAlert("DEGRADATION", "warn");
 #endif
-                drift_cusum = 0.0f;   // re-arm for the next sustained creep
+                drift_cusum = 0.0f;
             }
         }
-        drift_cycle_sum = 0.0f; drift_cycle_n = 0;   // reset accumulator for next cycle
+        drift_cycle_sum = 0.0f; drift_cycle_n = 0;
 
-        // Evaluation: a monitored cycle that ended without a confirmed anomaly
-        // counts as "detected NORMAL" — a true negative if truth was NORMAL, a
-        // false negative (missed fault) if truth was a fault class.
+        // Evaluation: a clean monitored cycle counts as "detected NORMAL"
         if (current_mode == "MONITORING" && eval_truth >= 0 && !eval_cycle_recorded) {
             confmat[eval_truth][0]++;
             eval_count++;
@@ -700,17 +608,15 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         }
 
         current_mode = "IDLE";
-        push_event("phase", "IDLE — waiting for next target cycle");
+        push_event("phase", "IDLE - waiting for next target cycle");
 
     } else if (s == "CMD:RESET") {
         system_locked   = false;
         anomaly_reason  = "NONE";
-        
         stall_confirm = 0;
         dry_confirm   = 0;
         volt_confirm  = 0;
         temp_confirm  = 0;
-
         ewma_init       = false;
         current_mode    = "IDLE";
         digitalWrite(BUZZER_PIN, LOW);
@@ -718,10 +624,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 }
 
-// ── HTTP handlers ─────────────────────────────────────────────────────────
-// HTML is streamed in 1 KB chunks via sendContent_P to avoid a 7 KB heap
-// allocation on every page load (which under load would fragment the heap
-// and trigger watchdog resets).
+// HTTP: serve the dashboard (streamed in 1 KB chunks)
 void handleRoot() {
     size_t total = strlen(html_page);
     server.setContentLength(total);
@@ -737,6 +640,7 @@ void handleRoot() {
     }
 }
 
+// HTTP: live data as JSON
 void handleData() {
     char buf[460];
     snprintf(buf, sizeof(buf),
@@ -755,11 +659,7 @@ void handleData() {
     server.send(200, "application/json", buf);
 }
 
-// Evaluation endpoint.
-//   /eval?truth=K  (K=0..5)  → label the upcoming monitored cycles
-//   /eval?off=1               → stop labelling
-//   /eval?reset=1             → clear the confusion matrix and latency
-//   /eval                     → JSON: truth, count, mean latency, flat 6×6 matrix
+// HTTP: evaluation harness. /eval?truth=K | /eval?off=1 | /eval?reset=1 | /eval (JSON: truth,count,lat,6x6 matrix)
 void handleEval() {
     if (server.hasArg("reset")) {
         memset(confmat, 0, sizeof(confmat));
@@ -789,9 +689,8 @@ void handleEval() {
     snprintf(buf + n, sizeof(buf) - n, "]}");
     server.send(200, "application/json", buf);
 }
-// Clear a halt latch. Shared by HTTP (/cmd?a=clear_halt) and MQTT. Valid in both
-// modes: unlock the observer and tell the target to clear its latch (in auto mode
-// the target reboots into a fresh cycle; in manual mode it returns to idle).
+
+// Clear a halt latch (shared by HTTP and MQTT). Valid in both modes.
 void applyClearHalt() {
     system_locked       = false;
     anomaly_reason      = "NONE";
@@ -804,15 +703,8 @@ void applyClearHalt() {
     for (int i = 0; i < 5; i++) { espNowSend("CMD:CLEAR_HALT"); delay(8); }
 }
 
-// target is awake in its idle loop and is a registered ESP-NOW peer, so we
-// send straight to it, repeated a few times for reliability like the HALT echo.
-//   /cmd?a=pump_on&sec=N   (N=0 or absent → infinite)
-//   /cmd?a=pump_off
-//   /cmd?a=feed&sec=N      (N=0 or absent → one-shot; N>0 → repeat every N s)
-//   /cmd?a=calibrate
-// Manual actuator commands shared by HTTP /cmd and MQTT. Builds the ESP-NOW
-// command, updates local state/events, and sends it to the target. Returns
-// false for an unknown action. (clear_halt and mode are handled separately.)
+// Manual actuator commands shared by HTTP /cmd and MQTT (OFF mode only).
+// pump_on[:sec] | pump_off | feed[:sec] | feed_stop | calibrate
 bool applyManualCmd(const String& a, long sec) {
     if (sec < 0) sec = 0;
     char cmd[40];
@@ -827,6 +719,9 @@ bool applyManualCmd(const String& a, long sec) {
     } else if (a == "feed") {
         snprintf(cmd, sizeof(cmd), "CMD:FEED:%ld", sec);
         push_event("phase", sec > 0 ? "Manual feed scheduled" : "Manual feed (once)");
+    } else if (a == "feed_stop") {
+        snprintf(cmd, sizeof(cmd), "CMD:FEED_STOP");
+        push_event("phase", "Manual feeding stopped");
     } else if (a == "calibrate") {
         snprintf(cmd, sizeof(cmd), "CMD:CALIBRATE");
         push_event("phase", "Manual calibration requested");
@@ -837,17 +732,15 @@ bool applyManualCmd(const String& a, long sec) {
     return true;
 }
 
+// HTTP: manual controls. Clear HALT works in both modes; everything else only in OFF.
 void handleCmd() {
     String a = server.hasArg("a") ? server.arg("a") : "";
-    // Clear HALT must work in BOTH modes so an automatic-mode halt is
-    // recoverable from the dashboard, exactly like a manual-mode halt. Every
-    // other manual control is disabled while the automatic cycle owns the pump.
     if (autoMode && a != "clear_halt") {
         server.send(409, "application/json", "{\"err\":\"auto mode on\"}");
         return;
     }
     if (a == "clear_halt") {
-        applyClearHalt();   // shared with the MQTT path
+        applyClearHalt();
         server.send(200, "application/json", "{\"ok\":true,\"pump\":false}");
         return;
     }
@@ -861,23 +754,15 @@ void handleCmd() {
     server.send(200, "application/json", resp);
 }
 
-// /mode?set=on  → enable default cycle  (and reset state if coming from OFF)
-// /mode?set=off → suspend default cycle (system goes to IDLE)
-// Response: {"auto":true|false}
-// Apply a default-mode change (shared by HTTP /mode and MQTT). Persists the new
-// state to NVS and, on a real transition, runs the OFF→ON (fresh relearn) or
-// ON→OFF (pause + discard calibration) reset sequence.
+// Apply a default-mode change (shared by HTTP /mode and MQTT). On a real transition,
+// OFF->ON forces a fresh relearn, ON->OFF pauses and discards calibration.
 void applyMode(bool on) {
     bool was = autoMode;
     autoMode = on;
     obsPrefs.putBool("auto", autoMode);
 
     if (autoMode && !was) {
-        // OFF → ON transition: ALWAYS start a fresh learning cycle. Any
-        // previous calibration (manual or automatic) is discarded so the
-        // baseline always matches the current setup. Target relearns at
-        // boot 0; the dashboard threshold lines are cleared until the new
-        // calibration completes.
+        // OFF -> ON: always relearn (discard any calibration)
         system_locked     = false;
         anomaly_reason    = "NONE";
         last_anomaly_pushed = "NONE";
@@ -885,39 +770,35 @@ void applyMode(bool on) {
         stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
         ewma_init         = false;
         grace_period      = 0;
-        targetPumpOn      = false;   // manual pump state wiped on reset
+        targetPumpOn      = false;
         is_calibrated     = false;
         calFromManual     = false;
-        th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;  // clear chart lines
+        th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;
         drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
         pendingTargetCmd   = "CMD:AUTO_ON_RESET";
         pendingTargetCount = 5;
-        push_event("phase", "Default mode ON — fresh learning starting");
-        Serial.println("[OBS] Default mode → ON (fresh learning)");
+        push_event("phase", "Default mode ON - fresh learning starting");
+        Serial.println("[OBS] Default mode -> ON (fresh learning)");
     } else if (!autoMode && was) {
-        // ON → OFF transition: pause the cycle and DISCARD any calibration.
-        // The user re-calibrates manually in OFF (or it relearns on next ON).
+        // ON -> OFF: pause and discard calibration
         current_mode  = "IDLE";
         stall_confirm = volt_confirm = dry_confirm = temp_confirm = 0;
         ewma_init     = false;
-        targetPumpOn  = false;   // target enters idle with pump off
-        is_calibrated = false;   // wipe calibration
+        targetPumpOn  = false;
+        is_calibrated = false;
         calFromManual = false;
         anomaly_reason = "NONE";
         last_anomaly_pushed = "NONE";
-        th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;   // clear chart lines
+        th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;
         drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
         pendingTargetCmd   = "CMD:AUTO_OFF";
         pendingTargetCount = 5;
-        push_event("phase", "Default mode OFF — system paused, calibration cleared");
-        Serial.println("[OBS] Default mode → OFF (calibration cleared)");
+        push_event("phase", "Default mode OFF - system paused, calibration cleared");
+        Serial.println("[OBS] Default mode -> OFF (calibration cleared)");
     }
-    // No transition → no command needed
 }
 
-// /mode?set=on  → enable default cycle  (and reset state if coming from OFF)
-// /mode?set=off → suspend default cycle (system goes to IDLE)
-// Response: {"auto":true|false}
+// HTTP: /mode?set=on|off
 void handleMode() {
     if (server.hasArg("set")) {
         String v = server.arg("set"); v.toLowerCase();
@@ -928,10 +809,10 @@ void handleMode() {
     server.send(200, "application/json", buf);
 }
 
+// HTTP: event feed as JSON (incremental via ?last=ID)
 void handleEvents() {
     uint32_t last_id = server.hasArg("last")
                        ? (uint32_t)server.arg("last").toInt() : 0;
-    // Snapshot under critical section, then format JSON outside it.
     static EvtEntry snap[EVT_MAX];
     int snap_count, snap_start;
     portENTER_CRITICAL(&evt_mux);
@@ -964,10 +845,7 @@ void handleEvents() {
     server.send(200, "application/json", buf);
 }
 
-// smartDelay: like delay() but keeps the WebServer responsive. We replace the
-// blocking delay() calls in loop() with this so HTTP polling is never
-// starved while the observer waits between sensor ticks. Logic and timing
-// of loop() are unchanged.
+// Like delay() but keeps the WebServer responsive
 void smartDelay(unsigned long ms) {
     unsigned long t0 = millis();
     do {
@@ -976,7 +854,6 @@ void smartDelay(unsigned long ms) {
     } while (millis() - t0 < ms);
 }
 
-// ── setup ──────────────────────────────────────────────────────────────────
 void setup() {
     delay(3000);
     Serial.begin(115200);
@@ -985,6 +862,7 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
+    // I2C / INA219
     Wire.setPins(I2C_SDA, I2C_SCL);
     Wire.begin();
     Wire.setClock(100000);
@@ -994,16 +872,9 @@ void setup() {
         while (1) delay(100);
     }
 
-    // ── WiFi STA + ESP-NOW ─────────────────────────────────────────────────
-    // STA-only mode (no AP) so the dashboard is reachable on the user's
-    // existing network. The radio's channel is dictated by the router/hotspot;
-    // we read it back and pin ESP-NOW to that same channel. The target does
-    // the same scan independently, so both ESP32s converge on the same
-    // channel without any dedicated discovery AP.
+    // WiFi (STA only) + read back channel for ESP-NOW
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);   // disable modem sleep — critical for reliable ESP-NOW
-                            // reception while connected to a WiFi AP (matches what
-                            // target.cpp already does on its own setup)
+    WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("[OBS] Connecting to '%s'", WIFI_SSID);
@@ -1012,89 +883,80 @@ void setup() {
         delay(400); Serial.print(".");
     }
 
-    uint8_t esp_now_channel = 13;   // fallback (matches the v9 default)
+    uint8_t esp_now_channel = 13;
     if (WiFi.status() == WL_CONNECTED) {
         uint8_t pri; wifi_second_chan_t sec;
         esp_wifi_get_channel(&pri, &sec);
         esp_now_channel = pri;
-        Serial.printf("\n[OBS] WiFi OK — channel %d, dashboard at http://%s\n",
+        Serial.printf("\n[OBS] WiFi OK - channel %d, dashboard at http://%s\n",
                       esp_now_channel, WiFi.localIP().toString().c_str());
 #if MQTT_ENABLED
         mqtt.setServer(MQTT_HOST, MQTT_PORT);
-        mqtt.setBufferSize(512);   // our state/telemetry JSON exceeds the 256-byte default
-        mqtt.setCallback(mqttCallback);   // handle desired-state commands
+        mqtt.setBufferSize(512);
+        mqtt.setCallback(mqttCallback);
   #if MQTT_TLS
     #if MQTT_TLS_VERIFY
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // TLS needs real time for cert dates
-        mqttNet.setCACert(MQTT_ROOT_CA);                    // authenticate the broker
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        mqttNet.setCACert(MQTT_ROOT_CA);
     #else
-        mqttNet.setInsecure();   // TLS encryption without server-certificate validation
+        mqttNet.setInsecure();   // TLS without server-cert validation
     #endif
   #endif
 #endif
     } else {
-        Serial.println("\n[OBS] WiFi not found — fallback channel 13 (no dashboard)");
+        Serial.println("\n[OBS] WiFi not found - fallback channel 13 (no dashboard)");
         esp_wifi_set_promiscuous(true);
         esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE);
         esp_wifi_set_promiscuous(false);
     }
 
+    // ESP-NOW
     if (esp_now_init() != ESP_OK) {
         Serial.println("[OBS] ESP-NOW init failed");
         return;
     }
     esp_now_register_recv_cb(OnDataRecv);
-    esp_now_set_pmk(ESPNOW_PMK);              // shared primary master key
+    esp_now_set_pmk(ESPNOW_PMK);
 
     esp_now_peer_info_t peer;
     memset(&peer, 0, sizeof(peer));
     memcpy(peer.peer_addr, targetAddress, 6);
-    // channel 0 = "use the current radio channel". As a STA the observer's radio
-    // follows the hotspot if it hops channels; pinning the peer to the channel
-    // captured at boot would break ESP-NOW on the next hop, so we send on the
-    // current channel instead.
-    peer.channel = 0;
-    memcpy(peer.lmk, ESPNOW_LMK, 16);         // per-peer key → AES-CCM
+    peer.channel = 0;                 // use current radio channel
+    memcpy(peer.lmk, ESPNOW_LMK, 16);
     peer.encrypt = true;
     esp_now_add_peer(&peer);
 
-    // Register HTTP routes; quick 204 for /favicon.ico and other unknowns.
+    // HTTP routes
     server.on("/",            HTTP_GET, handleRoot);
     server.on("/data",        HTTP_GET, handleData);
     server.on("/events",      HTTP_GET, handleEvents);
-    server.on("/mode",        HTTP_GET, handleMode);   // dashboard toggle
-    server.on("/cmd",         HTTP_GET, handleCmd);    // manual controls (OFF only)
-    server.on("/eval",        HTTP_GET, handleEval);   // evaluation harness
-    // Browsers automatically request /favicon.ico — registering an explicit
-    // empty handler silences the WebServer "request handler not found" log.
+    server.on("/mode",        HTTP_GET, handleMode);
+    server.on("/cmd",         HTTP_GET, handleCmd);
+    server.on("/eval",        HTTP_GET, handleEval);
     server.on("/favicon.ico", HTTP_GET, [](){ server.send(204, "text/plain", ""); });
     server.onNotFound([](){ server.send(204, "text/plain", ""); });
     server.begin();
 
-    // Load persistent default-mode toggle from NVS (defaults to ON first boot)
+    // Default-mode toggle from NVS
     obsPrefs.begin("float-obs", false);
     autoMode = obsPrefs.getBool("auto", true);
     Serial.printf("[OBS] Default mode at boot: %s\n", autoMode ? "ON" : "OFF");
 
-    push_event("phase", "IDLE — system online");
+    push_event("phase", "IDLE - system online");
 
-    Serial.println("\n╔══════════════════════════════════════════════╗");
-    Serial.println("║  FLOAT  –  Observer Node (v9)               ║");
-    Serial.println("║  EWMA+Hampel | DRY_RUN | Dynamic TEMP       ║");
-    Serial.println("║  VOLT/TEMP = warning only (no halt)         ║");
-    Serial.println("╚══════════════════════════════════════════════╝");
+    Serial.println("\n== FLOAT Observer Node ==");
+    Serial.println("EWMA+Hampel | DRY_RUN | dynamic TEMP | VOLT/TEMP = warning only");
 }
 
-// ── loop ───────────────────────────────────────────────────────────────────
 void loop() {
-    server.handleClient();   // serve dashboard HTTP traffic every iteration
+    server.handleClient();
 #if MQTT_ENABLED
-    mqttTask();              // cloud keepalive + periodic telemetry/state publish
+    mqttTask();
 #endif
 
+    // INA219 read (recover the bus on a bad reading)
     float raw_current = ina219.getCurrent_mA();
     float bus_voltage = ina219.getBusVoltage_V();
-
     if (raw_current > 3000.0f || isnan(raw_current)) {
         Wire.end(); delay(10);
         Wire.setPins(I2C_SDA, I2C_SCL); Wire.begin(); Wire.setClock(100000);
@@ -1102,7 +964,6 @@ void loop() {
         raw_current = 0.0f;
         bus_voltage = 0.0f;
     }
-
     last_current = max(0.0f, raw_current);
     last_voltage = max(0.0f, bus_voltage);
 
@@ -1113,6 +974,7 @@ void loop() {
         ewma_current = EWMA_ALPHA * last_current + (1.0f - EWMA_ALPHA) * ewma_current;
     }
 
+    // Halted: keep buzzing + telemetry until Clear HALT
     if (system_locked) {
         Serial.printf("[HALT] Locked. I=%.1f mA  V=%.2f V  T=%.1f C\n",
                       last_current, last_voltage, last_temp_c);
@@ -1125,14 +987,14 @@ void loop() {
         return;
     }
 
+    // LEARNING: collect current samples (pump-load only)
     if (current_mode == "LEARNING") {
         if (last_current > 50.0f && sample_idx < MAX_SAMPLES) {
             samples[sample_idx++] = last_current;
         }
-
         if (new_temp_for_learn) {
             new_temp_for_learn = false;
-            int row = temp_sample_idx; 
+            int row = temp_sample_idx;
             Serial.printf("   [LEARN] #%d  I=%.2f mA  V=%.2f V  T=%.2f C\n",
                           row, last_current, last_voltage, last_temp_c);
         }
@@ -1140,14 +1002,15 @@ void loop() {
         return;
     }
 
+    // MONITORING: detect anomalies on EWMA + confirmation counters
     if (current_mode == "MONITORING" && is_calibrated) {
         if (grace_period > 0) {
             grace_period--;
-            Serial.printf("   [MON] Motor inrush — alarms suppressed (%d left)  I_raw=%.1f mA\n",
+            Serial.printf("   [MON] Motor inrush - alarms suppressed (%d left)  I_raw=%.1f mA\n",
                           grace_period, last_current);
             if (grace_period == 0) {
                 ewma_current = last_current;
-                Serial.printf("   [MON] Grace period ended — EWMA seeded at %.1f mA\n", ewma_current);
+                Serial.printf("   [MON] Grace period ended - EWMA seeded at %.1f mA\n", ewma_current);
             }
             smartDelay(400);
             return;
@@ -1156,19 +1019,16 @@ void loop() {
         bool stall_flag     = (ewma_current > th_stall);
         bool volt_flag      = (th_volt_min > 0.1f && last_voltage < th_volt_min);
         bool dry_flag       = (th_dry_run  > 0.1f && ewma_current < th_dry_run);
-        
+
         bool temp_high_flag = false;
         bool temp_low_flag  = false;
-        
         if (last_temp_c != -127.0f && last_temp_c > -10.0f) {
             temp_high_flag = (last_temp_c > th_temp_high);
             temp_low_flag  = (last_temp_c < th_temp_low);
         }
         bool temp_flag = temp_high_flag || temp_low_flag;
 
-        // Evaluation: timestamp the first RAW out-of-range sample of the cycle.
-        // Latency is measured from here to ANOMALY CONFIRMED, so it captures the
-        // full EWMA-smoothing + confirmation delay, not just a fixed count.
+        // Evaluation: timestamp first raw out-of-range sample (for latency)
         if (eval_truth >= 0 && eval_onset_ms == 0) {
             bool raw_bad = (last_current > th_stall) ||
                            (th_dry_run  > 0.1f && last_current < th_dry_run) ||
@@ -1182,20 +1042,19 @@ void loop() {
         if (dry_flag)   dry_confirm++;   else dry_confirm = 0;
         if (temp_flag)  temp_confirm++;  else temp_confirm = 0;
 
-        // Degradation tracking: collect only healthy operating samples (a stall
-        // or dry-run spike must not pollute the cycle's representative current).
+        // Degradation: accumulate only healthy samples
         if (!stall_flag && !dry_flag) {
             drift_cycle_sum += ewma_current;
             drift_cycle_n++;
         }
 
-        bool anomaly = (stall_confirm >= CONFIRM_NEEDED) || 
-                       (volt_confirm >= CONFIRM_NEEDED) || 
-                       (dry_confirm >= CONFIRM_NEEDED) || 
+        bool anomaly = (stall_confirm >= CONFIRM_NEEDED) ||
+                       (volt_confirm >= CONFIRM_NEEDED) ||
+                       (dry_confirm >= CONFIRM_NEEDED) ||
                        (temp_confirm >= CONFIRM_NEEDED);
 
         Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  V=%.2f  T=%.1f"
-                      "  thr[↑%.1f↓%.1f]  [S:%d V:%d D:%d T:%d]%s%s%s%s%s\n",
+                      "  thr[H%.1f L%.1f]  [S:%d V:%d D:%d T:%d]%s%s%s%s%s\n",
                       last_current, ewma_current, last_voltage, last_temp_c,
                       th_temp_high, th_temp_low,
                       stall_confirm, volt_confirm, dry_confirm, temp_confirm,
@@ -1213,13 +1072,8 @@ void loop() {
             else                                      anomaly_reason = "TEMP_TOO_LOW";
 
             Serial.printf("\n[!!!] ANOMALY CONFIRMED: %s\n", anomaly_reason.c_str());
-            Serial.printf("   I_ewma=%.2f mA  V=%.2f V  T=%.1f C"
-                          "  (thr ↑%.1f ↓%.1f)\n",
-                          ewma_current, last_voltage, last_temp_c,
-                          th_temp_high, th_temp_low);
 
-            // Evaluation: record this cycle's outcome once (detected = reason),
-            // with detection latency from the first raw-abnormal sample.
+            // Evaluation: record outcome (detected = reason) + latency
             if (eval_truth >= 0 && !eval_cycle_recorded) {
                 int det = reasonToClass(anomaly_reason);
                 confmat[eval_truth][det]++;
@@ -1233,10 +1087,7 @@ void loop() {
                               eval_truth, det, eval_count);
             }
 
-            // Dashboard pop-up: push a typed event the UI turns into a toast.
-            // "halt" = red (stops the pump), "warn" = orange (advisory only).
-            // Throttled so a persistent temp/voltage condition doesn't spam:
-            // re-push only when the reason changes or after 15 s.
+            // Dashboard toast + cloud alert (throttled: re-push on reason change or after 15 s)
             bool isHalt = (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN");
             uint32_t nowm = (uint32_t)millis();
             bool notify_now = false;
@@ -1251,13 +1102,7 @@ void loop() {
                 notify_now = true;
             }
 
-            // MOTOR_STALL and DRY_RUN halt the system immediately — pump must stop.
-            // VOLTAGE_DROP, TEMP_TOO_HIGH, TEMP_TOO_LOW are warnings:
-            //   buzzer alerts the operator but the pump keeps running, because:
-            //   - Low voltage may be a momentary dip (battery, wiring); stopping
-            //     the pump mid-cycle could leave the aquarium unfiltered.
-            //   - Temperature is outside the safe range but the pump itself is healthy;
-            //     the operator needs to intervene (heater/cooler), not stop the pump.
+            // MOTOR_STALL / DRY_RUN -> halt the pump; VOLTAGE_DROP / TEMP -> warning only
             if (anomaly_reason == "MOTOR_STALL" || anomaly_reason == "DRY_RUN") {
                 for (int i = 0; i < 10; i++) { espNowSend("HALT"); delay(5); }
                 system_locked = true;
@@ -1270,14 +1115,11 @@ void loop() {
 
             buzzerAlert(3);
 
-            // Email LAST: it's a blocking HTTPS call (~seconds), so it must run only
-            // after the pump has already been commanded to stop (HALT above).
+            // Email last (blocking HTTPS), only after the pump has been told to stop
 #if EMAIL_ALERTS_ENABLED
             if (notify_now) sendEmailAlert(anomaly_reason.c_str(), isHalt ? "halt" : "warn");
 #endif
-            
-            // For non-halting anomalies, reset their confirm counter so the next
-            // check starts fresh (avoids a continuous stream of alerts).
+
             if (!system_locked) {
                 volt_confirm = 0;
                 temp_confirm = 0;
@@ -1293,6 +1135,7 @@ void loop() {
         return;
     }
 
+    // IDLE
     Serial.printf("[IDLE] I=%.2f mA  V=%.2f V  T=%.1f C\n",
                   last_current, last_voltage, last_temp_c);
     char buf[128];
