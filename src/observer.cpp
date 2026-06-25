@@ -15,8 +15,8 @@
 #include "dashboard.h"
 
 // WiFi (edit in sync with target.cpp; fallback channel 13 if not found)
-const char* WIFI_SSID = "iPhone di Michele";
-const char* WIFI_PASS = "Michele4!";
+const char* WIFI_SSID = "Pixel_3478";
+const char* WIFI_PASS = "sounciocco";
 
 // MQTT cloud bridge (HiveMQ Cloud, private + authenticated, TLS)
 #define MQTT_ENABLED    1
@@ -101,9 +101,12 @@ bool          targetHalted        = false;
 // Pins
 const int I2C_SDA     = 41;
 const int I2C_SCL     = 42;
+const int I2C2_SDA    = 47;   // INA #2 (Uno 9V)  - bus 1 (Wire1), due pin NUOVI
+const int I2C2_SCL    = 48;
 const int BUZZER_PIN  = 7;
 
 Adafruit_INA219 ina219;
+Adafruit_INA219 ina219_uno;
 WebServer       server(80);
 
 // ESP-NOW peer (Target MAC) + AES-CCM keys (must match target.cpp byte-for-byte)
@@ -183,6 +186,13 @@ int reasonToClass(const String& r) {
 }
 
 // Latest sensor readings
+// Arduino Uno 9V supply (INA #2, separate I2C bus)
+float    last_uno_V = 0.0f;
+float    last_uno_I = 0.0f;
+bool     ina_uno_ok = false;
+uint32_t uno_read_last = 0;
+const float UNO_BATT_WARN_V = 7.0f;
+bool     uno_batt_warned = false;
 float last_current  = 0.0f;
 float last_voltage  = 0.0f;
 float last_temp_c   = 25.0f;
@@ -640,21 +650,29 @@ void handleRoot() {
     }
 }
 
-// HTTP: live data as JSON
 void handleData() {
-    char buf[460];
+    // Single consumption graph = INSTANTANEOUS SUM of both INA219 (Target + Uno).
+    // Detection stays internal on the Target current only; here we just shift the
+    // displayed values by the Uno draw so the one chart is consistent.
+    float i_total  = last_current + last_uno_I;                                   // Raw line
+    float ie_total = ewma_current + last_uno_I;                                   // EWMA line
+    float ths_disp = (th_stall   > 0.1f) ? (th_stall   + last_uno_I) : 0.0f;      // stall line
+    float thd_disp = (th_dry_run > 0.1f) ? (th_dry_run + last_uno_I) : 0.0f;      // dry line
+    char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"I\":%.2f,\"I_ewma\":%.2f,\"V\":%.2f,\"T\":%.2f,\"turb\":%.1f"
         ",\"mode\":\"%s\",\"locked\":%s,\"auto\":%s,\"pump\":%s,\"thalt\":%s"
         ",\"th_stall\":%.2f,\"th_dry\":%.2f,\"th_thi\":%.2f,\"th_tlo\":%.2f"
+        ",\"uno_v\":%.2f,\"uno_i\":%.1f,\"uno_ok\":%s"
         ",\"evt_seq\":%lu}",
-        last_current, ewma_current, last_voltage, last_temp_c, last_turb,
+        i_total, ie_total, last_voltage, last_temp_c, last_turb,
         current_mode.c_str(),
         system_locked ? "true" : "false",
         autoMode      ? "true" : "false",
         targetPumpOn  ? "true" : "false",
         targetHalted  ? "true" : "false",
-        th_stall, th_dry_run, th_temp_high, th_temp_low,
+        ths_disp, thd_disp, th_temp_high, th_temp_low,
+        last_uno_V, last_uno_I, ina_uno_ok ? "true" : "false",
         (unsigned long)evt_seq);
     server.send(200, "application/json", buf);
 }
@@ -862,14 +880,22 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
-    // I2C / INA219
+// I2C bus 0 - INA #1 (Target)
     Wire.setPins(I2C_SDA, I2C_SCL);
     Wire.begin();
     Wire.setClock(100000);
     delay(100);
     if (!ina219.begin()) {
-        Serial.println("[OBS] CRITICAL: INA219 not found!");
+        Serial.println("[OBS] CRITICAL: INA219 (Target) not found!");
         while (1) delay(100);
+    }
+    // I2C bus 1 - INA #2 (Arduino Uno 9V): bus separato, stesso 0x40
+    Wire1.begin(I2C2_SDA, I2C2_SCL, 100000);
+    if (ina219_uno.begin(&Wire1)) {
+        ina_uno_ok = true;
+        Serial.println("[OBS] INA219 (Uno 9V) detected on I2C bus 1");
+    } else {
+        Serial.println("[OBS] WARNING: INA219 (Uno 9V) not found on bus 1 - battery monitor off");
     }
 
     // WiFi (STA only) + read back channel for ESP-NOW
@@ -972,6 +998,27 @@ void loop() {
         ewma_init    = true;
     } else {
         ewma_current = EWMA_ALPHA * last_current + (1.0f - EWMA_ALPHA) * ewma_current;
+    }
+
+// --- Arduino Uno 9V monitor (INA #2, bus 1; additivo, NON tocca la v9) ---
+    if (ina_uno_ok && (millis() - uno_read_last >= 2000)) {
+        uno_read_last = millis();
+        float uv = ina219_uno.getBusVoltage_V();
+        float ui = ina219_uno.getCurrent_mA();
+        if (!isnan(uv)) last_uno_V = max(0.0f, uv);
+        if (!isnan(ui)) last_uno_I = ui;
+        Serial.printf("[UNO] battery %.2f V  draw %.1f mA\n", last_uno_V, last_uno_I);
+        if (last_uno_V > 1.0f && last_uno_V < UNO_BATT_WARN_V && !uno_batt_warned) {
+            uno_batt_warned = true;
+            Serial.printf("[WARN] Arduino 9V battery low (%.2f V) - replace soon\n", last_uno_V);
+            push_event("warn", "Arduino 9V battery low - replace soon");
+            buzzerAlert(2);
+#if MQTT_ENABLED
+            mqttPublishAlert("UNO_BATTERY_LOW", "warn");
+#endif
+        } else if (last_uno_V > UNO_BATT_WARN_V + 0.5f) {
+            uno_batt_warned = false;
+        }
     }
 
     // Halted: keep buzzing + telemetry until Clear HALT

@@ -253,7 +253,7 @@ const unsigned long MAX_TURB_WAIT_MS = 4500;
 float readTurbidityFromArduino(float temp_c = 25.0f) {
     Serial1.begin(9600, SERIAL_8N1, TURB_RXD, TURB_TXD);
     delay(100);
-
+    sendMsg("LOG", "[TGT] inizio lettura torbidita' - mando 'T'");
     int   raw_adc   = 0;
     bool  got_value = false;
     unsigned long search_start = millis();
@@ -330,7 +330,7 @@ float safeTemp(float raw) {
 }
 
 // WiFi: scan for the Observer's SSID and pin ESP-NOW to its channel (must match observer.cpp)
-const char* WIFI_SSID = "iPhone di Michele";
+const char* WIFI_SSID = "Pixel_3478";
 
 uint8_t findChannel() {
     for (int attempt = 0; attempt < 5; attempt++) {
