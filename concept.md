@@ -112,7 +112,7 @@ The **ESP-NOW safety loop is independent** of the WiFi/router/cloud blocks: even
 
 ## 6. Target Users
 
-Home and hobbyist aquarium owners who want automated, offline-first protection for their fish — without a subscription, without trusting a vendor cloud for safety, and with the option of remote monitoring when they want it. The safety features need no router; the remote features use whatever WiFi is already available.
+Home and hobbyist aquarium owners who want automated, offline-first protection for their fish: without a subscription, without trusting a vendor cloud for safety, and with the option of remote monitoring when they want it. The safety features need no router; the remote features use whatever WiFi is already available.
 
 ## 7. Scope and Limitations
 
@@ -127,7 +127,7 @@ Home and hobbyist aquarium owners who want automated, offline-first protection f
 - Encrypted ESP-NOW and authenticated TLS cloud.
 - On-device labelled-confusion-matrix evaluation harness.
 
-**Out of scope (acknowledged, with reasons):**
+**Out of scope:**
 - **LoRaWAN long-range uplink.** The hardware (Heltec boards) carries an unused LoRa radio; a LoRaWAN variant for a remote/outdoor tank is the most natural next step, but it was not required for an indoor, WiFi-covered deployment.
 - **Additional water-chemistry sensors** (pH, dissolved oxygen, ammonia) — identified as future extensions.
 - **Multi-tank / fleet deployment** — the architecture would extend to it, but it was not implemented.
