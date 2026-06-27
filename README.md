@@ -2,6 +2,15 @@
 
 **Framework for Local Observation of Aquatic Tanks**
 
+| | |
+|---|---|
+| **Team** | Michele Libriani (1954541) · Andrea Folino (1986019) · Edoardo Zompanti (1985499) |
+| **Course** | Internet of Things - Sapienza University of Rome |
+| **Repository** | https://github.com/erdod/FLOAT |
+| **Demo / video** | `<INSERT YOUTUBE LINK>` |
+
+---
+
 FLOAT is an Edge IoT system designed to monitor and control aquatic tanks using low-power embedded devices.
 The system performs local monitoring, anomaly detection and actuator control without relying on cloud infrastructure.
 

@@ -1,15 +1,4 @@
-# FLOAT — Evaluation Document (Final)
-
-**FLOAT — Framework for Local Observation of Aquatic Tanks**
-
-| | |
-|---|---|
-| **Team** | Michele Libriani (1954541) · Andrea Folino (1986019) · Edoardo Zompanti (1985499) |
-| **Course** | Internet of Things — Sapienza University of Rome |
-| **Repository** | `<INSERT GITHUB REPOSITORY LINK>` |
-| **Previous version (history)** | `<INSERT LINK TO MID-TERM EVALUATION DOCUMENT>` |
-
----
+# FLOAT - Evaluation Document
 
 ## 1. Requirements Overview
 
@@ -22,7 +11,7 @@ Four requirements define the system's correctness and safety. Each is justified 
 | R3 | False-positive rate during normal operation | FPR over monitored cycles | < 0.1 % | ✅ 0 % over the measured NORMAL cycles |
 | R4 | Connectionless safety communication | No router / Internet on the safety path | Pump stops with no WiFi infrastructure | ✅ Verified |
 
-## 2. Evaluation Methodology — Labelled Confusion Matrix
+## 2. Evaluation Methodology - Labelled Confusion Matrix
 
 Anomaly detection is a **classification** problem, so it is evaluated with a confusion matrix rather than with anecdotal pass/fail observations. The Observer carries a built-in harness so the evaluation runs on the real hardware, on the real signal, with no separate test rig.
 
@@ -75,7 +64,7 @@ A small Python helper (`float_eval_report.py`, in the repository) ingests the `/
 
 This makes every reported number traceable to a deliberate, repeatable physical action, which is the point of the methodology: the evaluation reflects how the system behaves on the real signal, not on a simulation.
 
-## 3. R1 — Motor Anomaly Cutoff < 2000 ms
+## 3. R1 - Motor Anomaly Cutoff < 2000 ms
 
 ### Statement
 When the pump stalls or runs dry, the system must cut power to the pump within **2000 ms** of the onset.
@@ -109,10 +98,10 @@ A brushed DC pump under stall draws several times its rated current, and the win
 | Target ISR + GPIO write | < 1 ms |
 | **Total worst case** | **≈ 1251 ms** |
 
-### Result — ✅ met
+### Result - ✅ met
 The analysed worst-case reaction is ≈1251 ms, ≈750 ms inside the 2000 ms budget. Stall and dry-run injections (§2.4) confirmed the pump halting within this window in every trial.
 
-## 4. R2 — Temperature Out-of-Range Warning
+## 4. R2 - Temperature Out-of-Range Warning
 
 ### Statement
 If the water temperature leaves the safe band and stays out for ≈10 s, the system raises a **warning**. The pump is **not** stopped.
@@ -130,16 +119,16 @@ so a tropical tank calibrated at 26 °C and a cold-water tank at 20 °C get appr
 ### Latency and glitch suppression
 Out-of-range samples are counted; the counter resets the moment a valid in-range reading arrives, so only a *sustained* excursion (~10 s) triggers the warning. The DS18B20 occasionally returns its −127 °C disconnect sentinel on a CRC error; two independent guards (raw readings below −10 °C discarded on the Target, received values below −10 °C ignored on the Observer) keep these glitches from raising a false warning. The guards suppressed every glitch seen during testing.
 
-### Result — ✅ met
+### Result - ✅ met
 A confirmed excursion raises a buzzer pulse and a dashboard/cloud warning at ≈10 s while the pump keeps running; glitch suppression validated against the captured logs.
 
-## 5. R3 — False-Positive Rate < 0.1 %
+## 5. R3 - False-Positive Rate < 0.1 %
 
 ### Statement
 During normal operation, the rate of HALT events fired without any real stall, dry-run or electrical fault must stay below **0.1 %**.
 
 ### Why it matters
-A false halt disrupts circulation and alarms the user for no reason; repeated false alerts erode trust and push the operator to disable the safety features — defeating the purpose of the system. Suppressing false positives is therefore as important as catching real faults.
+A false halt disrupts circulation and alarms the user for no reason; repeated false alerts erode trust and push the operator to disable the safety features - defeating the purpose of the system. Suppressing false positives is therefore as important as catching real faults.
 
 ### Why the pipeline keeps FPR low
 The same layers that bound latency also reject the transients that would otherwise cause false halts:
@@ -148,10 +137,10 @@ The same layers that bound latency also reject the transients that would otherwi
 - **EWMA (α = 0.2)** keeps an isolated spike from moving the smoothed value across the threshold.
 - **3-sample confirmation** discards any single-tick transient.
 
-### Result — ✅ met
-Across the monitored NORMAL cycles recorded by the harness, **no** HALT fired without a real fault — an observed **FPR of 0 %**, within the < 0.1 % target. The result is reported as 0 % over the measured cycles (a finite sample), not as a theoretical zero, because real analog hardware remains exposed to rare external interference.
+### Result - ✅ met
+Across the monitored NORMAL cycles recorded by the harness, **no** HALT fired without a real fault - an observed **FPR of 0 %**, within the < 0.1 % target. The result is reported as 0 % over the measured cycles (a finite sample), not as a theoretical zero, because real analog hardware remains exposed to rare external interference.
 
-## 6. R4 — Connectionless Safety Communication
+## 6. R4 - Connectionless Safety Communication
 
 ### Statement
 The safety-critical Target↔Observer link must work without a WiFi router or Internet.
@@ -169,7 +158,7 @@ ESP-NOW is a connectionless Layer-2 protocol: it exchanges raw 802.11 frames bet
 ### Reliability measures
 Both nodes are pinned to the same radio channel (the Observer reads back its WiFi channel; the Target locks ESP-NOW to it, fallback channel 13), so frames are delivered regardless of background router traffic. The `HALT` command is sent ×10 (≈5 ms spacing) to bridge brief 2.4 GHz interference gaps, and critical commands carry a sequence number with up to 5 ACK-gated retries and exponential backoff.
 
-### Result — ✅ verified
+### Result - ✅ verified
 The safety loop operates purely at the MAC level; the pump stops on a stall/dry-run with no router and no Internet present. The frames are additionally AES-CCM encrypted (see the Design document).
 
 ## 7. Confusion-Matrix Results
@@ -179,19 +168,19 @@ Outcomes are recorded one-per-cycle into `confmat[truth][detected]`. The NORMAL 
 |              | det NORMAL | det STALL | det DRY | det VOLT | det T_HI | det T_LO |
 |--------------|:---------:|:---------:|:-------:|:--------:|:--------:|:--------:|
 | **NORMAL**   |  37       |   0       |  0      |   0      |   0      |   0      |
-| MOTOR_STALL  |   —       |   ✓       |  —      |   —      |   —      |   —      |
-| DRY_RUN      |   —       |   —       |  ✓      |   —      |   —      |   —      |
-| VOLTAGE_DROP |   —       |   —       |  —      |   ✓      |   —      |   —      |
-| TEMP_TOO_HIGH|   —       |   —       |  —      |   —      |   ✓      |   —      |
-| TEMP_TOO_LOW |   —       |   —       |  —      |   —      |   —      |   ✓      |
+| MOTOR_STALL  |   -       |   ✓       |  -      |   -      |   -      |   -      |
+| DRY_RUN      |   -       |   -       |  ✓      |   -      |   -      |   -      |
+| VOLTAGE_DROP |   -       |   -       |  -      |   ✓      |   -      |   -      |
+| TEMP_TOO_HIGH|   -       |   -       |  -      |   -      |   ✓      |   -      |
+| TEMP_TOO_LOW |   -       |   -       |  -      |   -      |   -      |   ✓      |
 
-Reading of the NORMAL row: 37/37 cycles classified NORMAL → **FPR = 0 %**, recall(NORMAL) = 100 %. The fault rows were validated functionally — blocking the impeller produced a `MOTOR_STALL` HALT and lifting the pump produced a `DRY_RUN` HALT in every attempt — and the systematic, fully counted matrix is produced by repeating the labelled injection protocol; the `float_eval_report.py` helper then prints the complete per-class recall/precision, accuracy, FPR/FNR and mean latency from the device's `/eval` output. This protocol is reproducible by anyone with the hardware, which is why it is documented here rather than reported as a single static number.
+Reading of the NORMAL row: 37/37 cycles classified NORMAL → **FPR = 0 %**, recall(NORMAL) = 100 %. The fault rows were validated functionally - blocking the impeller produced a `MOTOR_STALL` HALT and lifting the pump produced a `DRY_RUN` HALT in every attempt - and the systematic, fully counted matrix is produced by repeating the labelled injection protocol; the `float_eval_report.py` helper then prints the complete per-class recall/precision, accuracy, FPR/FNR and mean latency from the device's `/eval` output. This protocol is reproducible by anyone with the hardware, which is why it is documented here rather than reported as a single static number.
 
-## 8. Predictive Maintenance — CUSUM Validation
+## 8. Predictive Maintenance - CUSUM Validation
 
-Beyond catching a fault that has already happened, the system tries to **predict** degradation. A one-sided CUSUM accumulates the per-cycle healthy mean current against the learned baseline (`K = 1.0 σ` tolerance, `H = 3.0 σ` decision threshold) and raises a `DEGRADATION` warning when the draw creeps up persistently. Cycle-to-cycle noise washes out (the CUSUM is clamped at zero), while a sustained upward drift accumulates until it fires — the intended early-warning behaviour, verified by feeding progressively higher healthy-current cycles and observing the warning trigger only once the accumulated drift crossed `H·σ`.
+Beyond catching a fault that has already happened, the system tries to **predict** degradation. A one-sided CUSUM accumulates the per-cycle healthy mean current against the learned baseline (`K = 1.0 σ` tolerance, `H = 3.0 σ` decision threshold) and raises a `DEGRADATION` warning when the draw creeps up persistently. Cycle-to-cycle noise washes out (the CUSUM is clamped at zero), while a sustained upward drift accumulates until it fires - the intended early-warning behaviour, verified by feeding progressively higher healthy-current cycles and observing the warning trigger only once the accumulated drift crossed `H·σ`.
 
-## 9. Discussion — Not Implemented and Future Work
+## 9. Discussion - Not Implemented and Future Work
 
 **Not implemented (with reasons).**
 - **LoRaWAN uplink.** The Heltec boards carry an unused LoRa radio; a LoRaWAN variant for a remote/outdoor tank is the most natural extension but was unnecessary for an indoor, WiFi-covered deployment, so the effort went into the detection, cloud and evaluation layers instead.

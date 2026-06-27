@@ -1,37 +1,24 @@
-# FLOAT — Design Document (Final)
-
-**FLOAT — Framework for Local Observation of Aquatic Tanks**
-
-| | |
-|---|---|
-| **Team** | Michele Libriani (1954541) · Andrea Folino (1986019) · Edoardo Zompanti (1985499) |
-| **Course** | Internet of Things — Sapienza University of Rome |
-| **Repository** | `<INSERT GITHUB REPOSITORY LINK>` |
-| **Previous version (history)** | `<INSERT LINK TO MID-TERM DESIGN DOCUMENT>` |
-
----
+# FLOAT - Design Document 
 
 ## 1. Hardware Components
 
 | Component | Node | Role |
 |---|---|---|
-| ESP32-S3 (Heltec WiFi LoRa 32 V3) | Target | Sensing/actuation MCU; ESP-NOW; deep sleep |
-| ESP32-S3 (Heltec WiFi LoRa 32 V3) | Observer | Detection MCU; WiFi STA; dashboard + cloud gateway; INA219 host |
-| Arduino Uno | Turbidity front-end | Hosts the analog turbidity sensor; serves readings over UART |
-| INA219 #1 (I²C) | Observer | Pump supply current + bus voltage |
-| INA219 #2 (I²C, separate bus) | Observer | Auxiliary (Arduino Uno) supply current + voltage |
+| ESP32-S3 (Heltec WiFi LoRa 32 V3) | Target | Sensing/actuation; ESP-NOW; deep sleep |
+| ESP32-S3 (Heltec WiFi LoRa 32 V3) | Observer | Detection; WiFi STA; dashboard + cloud gateway; INA219 host |
+| Arduino Uno | Turbidity | Hosts the analog turbidity sensor; serves readings over UART |
+| INA219 #1 (I2C) | Observer | Pump supply current + bus voltage |
+| INA219 #2 (I2C, separate bus) | Observer | Arduino Uno supply current + voltage |
 | DS18B20 waterproof probe (1-Wire) | Target | Water temperature |
-| Analog turbidity sensor | Arduino Uno (ADC A0) | Water clarity (raw ADC → NTU) |
-| Submersible DC pump (3–5 V) | Target | Filtration / circulation |
+| Analog turbidity sensor | Arduino Uno | Water clarity (raw ADC → NTU) |
+| DC pump (3–5 V) | Target | Filtration / circulation |
 | SG90 micro-servo | Target | Food-dispenser gate |
 | Active buzzer | Observer | Local audible alarm |
-| Li-ion/LiPo 3.7 V + bulk capacitor | Target | Power; the bulk capacitor absorbs pump/servo inrush |
-| Regulated 5 V source (e.g. power bank) | Arduino Uno | Power; a clean common ground is required for the UART link |
+| Li-ion/LiPo 3.7 V + bulk capacitor | Target | Power |
+| Regulated 5 V source | Arduino Uno | Power|
 
 **Pin map (Target):** pump `GPIO47`, servo `GPIO6`, DS18B20 `GPIO7`, UART to Arduino `RXD1=GPIO4 / TXD1=GPIO5`.
-**Pin map (Observer):** INA219 #1 on I²C bus 0 `SDA=GPIO41 / SCL=GPIO42`; INA219 #2 on I²C bus 1 `SDA=GPIO47 / SCL=GPIO48`; buzzer `GPIO7`.
-
-**Power note (design decision from bring-up):** the pump and servo draw sharp inrush currents. A **bulk electrolytic capacitor** across the Target supply prevents the voltage sag that would otherwise brown-out the ESP32 mid-cycle. The Arduino Uno is powered from a **stable 5 V source sharing a common ground** with the Target; without a solid common ground the 5 V→3.3 V serial link between them becomes unreliable.
+**Pin map (Observer):** INA219 #1 on I2C bus 0 `SDA=GPIO41 / SCL=GPIO42`; INA219 #2 on I2C bus 1 `SDA=GPIO47 / SCL=GPIO48`; buzzer `GPIO7`.
 
 ## 2. Network Architecture
 
@@ -44,8 +31,8 @@ The Observer simultaneously acts as the gateway to the outside world over its Wi
    • turbidity          • temp, pump, servo                                       • detection + CUSUM
                                                                                   • 2× INA219
                                                                                   • WiFi STA gateway
-                                                                                        │
-                            ┌───────────────────────────────────────────────────────────┤
+                                                                                          │
+                            ┌──────────────────────────────┌──────────────────────────────┤
                             ▼                              ▼                              ▼
                    Local dashboard (LAN)        MQTT broker (HiveMQ, TLS)        E-mail (Apps Script)
                    http://<observer-ip>/        float/aq1/{telemetry,state,      HTTPS webhook on alert
@@ -70,7 +57,7 @@ The Observer simultaneously acts as the gateway to the outside world over its Wi
 
 Critical commands carry a sequence number and are retried up to 5 times with exponential backoff until acknowledged.
 
-### 3.2 Target ↔ Arduino Uno (UART, 9600 baud)
+### 3.2 Target ↔ Arduino Uno (UART)
 
 A request/echo handshake on `Serial1`: the Target sends `'T'`, the Uno replies with the raw ADC value terminated by newline, and the Target confirms with `'E'<value>`. The Uno sleeps on its watchdog (~4 s) and listens briefly on each wake; the Target repeats `'T'` long enough to always catch a wake window. On timeout the Target falls back to a safe default reading. The acquisition runs **before** the ESP32 radio is enabled, to keep RF noise off the analog line.
 
@@ -103,34 +90,34 @@ The retained `…/state` topic is the **device shadow**: any client that connect
 The autonomous cycle lives entirely inside `setup()` (one full cycle per wake), so the Target can deep-sleep between cycles. `loop()` runs **only** in manual (OFF) mode, where it acts as a bench: it services the manual pump/feed/calibrate requests and emits a heartbeat.
 
 ```
-                 boot (RTC + NVS state restored)
+            boot (RTC + NVS state restored)
                           │
-            reset-storm filter (only resets that occurred
-            while the pump was driving load count toward a
-            safety halt; idle/sleep brownouts are ignored)
+      reset-storm filter (only resets that occurred
+      while the pump was driving load count toward a
+      safety halt; idle/sleep brownouts are ignored)
                           │
-            read DS18B20 temperature   ──►   read turbidity (Arduino UART)
+      read DS18B20 temperature   ──►   read turbidity (Arduino UART)
                           │
-            scan WiFi channel · init encrypted ESP-NOW
+      scan WiFi channel · init encrypted ESP-NOW
                           │
-            send boot data · grace window for piggy-backed HALT / AUTO_*
+      send boot data · grace window for piggy-backed HALT / AUTO_*
                           │
         ┌─────────────────┼───────────────────────────────┐
-        │ system halted?  │ default-mode OFF?              │ else: AUTO CYCLE
-        ▼                 ▼                                ▼
+        │ system halted?  │ default-mode OFF?             │ else: AUTO CYCLE
+        ▼                 ▼                               ▼
   stay awake,       stay awake, run loop()        set NVS safety latch
   show HALTED       as a manual bench             (halted=true, pumping=true)
   on dashboard                                            │
                                         ┌─────────────────┼───────────────────┐
-                                        │ bootCount == 0? │ turbidity ≤ 50?    │ else
-                                        ▼                 ▼                    ▼
+                                        │ bootCount == 0? │ turbidity ≤ 50?   │ else
+                                        ▼                 ▼                   ▼
                                   LEARN (pump 10 s,   MONITOR (pump 10 s,  feed (servo) +
                                   START_LEARN)        START_MONITOR)       short pump 5 s
                                         └─────────────────┼───────────────────┘
                                                           │
-                                        clean cycle → clear safety latch
+                                           clean cycle → clear safety latch
                                                           │
-                                                  deep sleep 20 s
+                                                   deep sleep 20 s
 ```
 
 **State persistence.** `RTC_DATA_ATTR` variables (boot counter, etc.) survive deep sleep but not a power loss. **NVS** flags (`halted`, `pumping`, `storm`, `auto`) survive *everything*, including brown-outs, and are the source of truth for safety. The `halted` flag is written **before** any pump activation and cleared only on a fully clean cycle, so a brown-out during a stall leaves the system safely halted on the next boot.
@@ -145,19 +132,21 @@ The Observer runs two concurrent contexts that share global state under a critic
       read INA219 #1 (current, voltage) · update EWMA
       read INA219 #2 every 2 s (auxiliary current, battery-low warning)
                    │
-   ┌───────────────┼───────────────────────────────────────────────┐
-   │ system locked?│ mode == LEARNING?    │ mode == MONITORING & calibrated?
+   ┌───────────────┼───────────────────────┐
+   │system locked? │ mode == LEARNING?     │ mode == MONITORING & calibrated?
    ▼               ▼                       ▼
- buzz + HALT    collect current        grace period (skip inrush) → flags:
- telemetry,     samples                  STALL  : EWMA > μ + 3σ
- hold                                    DRY_RUN: EWMA < 0.30 μ
-                                         VOLT   : V < 0.90 V_cal
-                                         TEMP   : T outside learned band
-                                              │ confirm 3× consecutive
-                                              ▼
-                                         classify by priority → act
-                                              │
-                                         else → IDLE
+ buzz + HALT    collect current     grace period (skip inrush) → flags:
+ telemetry,     samples             STALL  : EWMA > μ + 3σ
+ hold                               DRY_RUN: EWMA < 0.30 μ
+                                    VOLT   : V < 0.90 V_cal
+                                    TEMP   : T outside learned band
+                                           │
+                                           │ confirm 3× consecutive
+                                           ▼
+                                    classify by priority → act
+                                           │
+                                           ▼
+                                      else → IDLE
 ```
 
 The receive callback handles `START_LEARN` / `START_MONITOR` / `STOP_MEASURE`. On `STOP_MEASURE` after a learning cycle it runs the Hampel calibration; after a monitoring cycle it folds the healthy mean into the CUSUM and records the evaluation outcome.
@@ -165,7 +154,9 @@ The receive callback handles `START_LEARN` / `START_MONITOR` / `STOP_MEASURE`. O
 ### 4.3 Operating Modes
 
 - **Autonomous (ON):** the Target runs the sense → sleep → act cycle on its own.
-- **Manual (OFF):** the Target stays awake; the operator can run the pump (timed), dispense food (once or on an interval), or force a calibration, from the dashboard or via MQTT. A mode change always discards the calibration and forces a fresh relearn, so thresholds are never applied to a stale baseline.
+- **Manual (OFF):** the Target stays awake; the operator can run the pump (timed), dispense food (once or on an interval), or force a calibration, from the dashboard or via MQTT. 
+
+A mode change always discards the calibration and forces a fresh relearn, so thresholds are never applied to a stale baseline.
 
 ## 5. Anomaly Detection Algorithm
 
@@ -216,7 +207,7 @@ ewma_t = α · I_raw + (1 − α) · ewma_{t−1}        α = 0.2
 
 Priority when several flags are active at once: `MOTOR_STALL` > `DRY_RUN` > `VOLTAGE_DROP` > `TEMP`. Only the two safety-critical anomalies stop the pump; the others are advisory, because cutting circulation on a voltage dip or a temperature excursion would harm the fish rather than help.
 
-## 6. Predictive Maintenance — CUSUM
+## 6. Predictive Maintenance - CUSUM
 
 At the end of each healthy monitoring cycle, the mean current of that cycle is compared to the learned baseline and accumulated in a one-sided CUSUM:
 
@@ -226,7 +217,7 @@ cusum   += dev,   clamped at 0
 fire if   cusum > H·σ                        H = 3.0   (decision threshold)
 ```
 
-A small but **persistent** upward drift in the pump's healthy current accumulates until it crosses the limit and raises a `DEGRADATION` service warning, while ordinary cycle-to-cycle noise washes out. This catches gradual wear or partial fouling before it becomes a hard stall — the predictive-maintenance goal.
+A small but **persistent** upward drift in the pump's healthy current accumulates until it crosses the limit and raises a `DEGRADATION` service warning, while ordinary cycle-to-cycle noise washes out. This catches gradual wear or partial fouling before it becomes a hard stall - the predictive-maintenance goal.
 
 ## 7. Multi-Sensor Fusion
 
@@ -240,7 +231,8 @@ Without it, a warming tank would appear to "self-clean", masking a real water-qu
 
 ## 8. Power-Consumption Monitoring (two INA219)
 
-INA219 #1 measures the pump branch (and feeds the detector). INA219 #2 measures the auxiliary (Arduino Uno) supply on a **separate I²C bus**, so the dashboard can show a single **total instantaneous consumption** (the sum of both branches) and warn when the auxiliary battery voltage drops below a safe level. The detector itself always operates on the pump branch alone, so the auxiliary reading never affects anomaly thresholds.
+INA219 #1 measures the current and voltage of the Target node, including the pump and the sensors connected to it, and provides the measurements used by the anomaly detection algorithms. INA219 #2 monitors the power consumption of the Arduino Uno, which is dedicated to acquiring turbidity sensor readings. 
+For the dashboard, the currents measured by both INA219 sensors are summed to display the system's total instantaneous power consumption.
 
 ## 9. Dashboard, Cloud and Remote Control
 
@@ -253,12 +245,8 @@ INA219 #1 measures the pump branch (and feeds the detector). INA219 #2 measures 
 | Layer | Measure | Rationale |
 |---|---|---|
 | ESP-NOW (Target↔Observer) | **AES-CCM encryption** (PMK + per-peer LMK) | Confidentiality + authenticity of the safety link |
-| MQTT (Observer↔cloud) | **TLS** with **broker-certificate verification** (root CA pinned, NTP-synced) and username/password auth | Encrypted, server-authenticated, access-controlled cloud channel |
+| MQTT (Observer↔cloud) | **TLS** with **broker-certificate verification** and username/password auth | Encrypted, server-authenticated, access-controlled cloud channel |
 | E-mail webhook | HTTPS | Encrypted transport to the notification endpoint |
-| Dashboard commands | Manual actions gated to OFF mode; halt-aware command handling | A passive page load cannot drive actuators; commands are refused while critical |
-| Safety state | NVS latch + pump-load reset-storm filter | A power glitch cannot silently restart a halted pump |
-
-Known limitation: the local dashboard is served over HTTP (the on-device web server does not provide TLS without self-signed-certificate management); the dashboard is reachable only on the local network, and the safety-critical channel (ESP-NOW) is the one that is encrypted. HTTPS for the dashboard is identified as a future improvement.
 
 ## 11. Deep Sleep and Energy
 
