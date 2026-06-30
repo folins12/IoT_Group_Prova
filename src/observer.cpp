@@ -536,7 +536,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             th_stall      = baseline_mean + (3.0f * baseline_std);
             if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
             th_volt_min   = last_voltage * 0.90f;
-            th_dry_run    = baseline_mean * 0.30f;
+            th_dry_run    = baseline_mean * 0.85f;
 
             if (temp_sample_idx >= 3) {
                 float temp_mean, temp_std;
@@ -566,7 +566,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             Serial.printf("   mean (mu)  : %.2f mA\n",          baseline_mean);
             Serial.printf("   std (sigma): %.2f mA\n",          baseline_std);
             Serial.printf("   Stall thr  : %.2f mA  (mu+3sigma)\n", th_stall);
-            Serial.printf("   Dry-run    : %.2f mA  (30%% mu)\n",  th_dry_run);
+            Serial.printf("   Dry-run    : %.2f mA  (85%% mu)\n",  th_dry_run);
             Serial.printf("   Volt min   : %.2f V\n",            th_volt_min);
 
             char buf[200];
