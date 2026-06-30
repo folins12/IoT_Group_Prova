@@ -1,19 +1,32 @@
-# FLOAT - Evaluation Document
+# FLOAT - Evaluation Document (Final)
+
+**FLOAT - Framework for Local Observation of Aquatic Tanks**
+
+| | |
+|---|---|
+| **Team** | Michele Libriani (1954541) · Andrea Folino (1986019) · Edoardo Zompanti (1985499) |
+| **Course** | Internet of Things - Sapienza University of Rome |
+| **Repository** | `<INSERT GITHUB REPOSITORY LINK>` |
+| **Previous version (history)** | `<INSERT LINK TO MID-TERM EVALUATION DOCUMENT>` |
+
+---
 
 ## 1. Requirements Overview
 
-Four requirements define the system's correctness and safety. Each is justified below from first principles, and measured with the on-device evaluation harness described in §2.
+Four requirements define the system's correctness and safety. Each is justified below from first principles and measured with the on-device evaluation harness of §2. The results column reports the figures obtained from a labelled run of 64 monitored cycles.
 
 | # | Requirement | Metric | Target | Result |
 |---|---|---|---|---|
-| R1 | Motor anomaly cutoff (stall / dry-run) | Reaction time from onset | < 2000 ms | ✅ ≈ 1251 ms (analysed worst-case, confirmed by injection) |
-| R2 | Temperature out-of-range warning | Detection latency | ≈ 10 s by design | ✅ Met; advisory (pump keeps running) |
-| R3 | False-positive rate during normal operation | FPR over monitored cycles | < 0.1 % | ✅ 0 % over the measured NORMAL cycles |
+| R1 | Motor anomaly cutoff (stall / dry-run) | Reaction time from onset | < 2000 ms | ✅ 1467 ms measured mean |
+| R2 | Temperature out-of-range warning | Detection | sustained ≈10 s excursion | ✅ 100 % recall (20/20 temp cycles), advisory |
+| R3 | False-positive rate during normal operation | FPR over NORMAL cycles | < 0.1 % | ✅ 0 % (0 / 10 NORMAL cycles) |
 | R4 | Connectionless safety communication | No router / Internet on the safety path | Pump stops with no WiFi infrastructure | ✅ Verified |
+
+Headline figures of the run: **accuracy 92.2 %**, **false-positive rate 0 %**, **false-negative rate 0 %** (no fault was ever missed), **mean detection latency 1467 ms**. The only errors were five inter-class confusions discussed in §7.
 
 ## 2. Evaluation Methodology - Labelled Confusion Matrix
 
-Anomaly detection is a **classification** problem, so it is evaluated with a confusion matrix rather than with anecdotal pass/fail observations. The Observer carries a built-in harness so the evaluation runs on the real hardware, on the real signal, with no separate test rig.
+Anomaly detection is a **classification** problem, so it is evaluated with a confusion matrix rather than with anecdotal pass/fail observations. The Observer carries a built-in harness so the evaluation runs on the real hardware, on the real current signal, with no separate test rig.
 
 ### 2.1 Classes
 
@@ -31,10 +44,12 @@ Six classes cover every state the detector can report:
 ### 2.2 How the harness works
 
 - The operator sets the **ground-truth** class for the upcoming cycle via `GET /eval?truth=<k>` (or from the developer dashboard panel, reachable with `?dev=1`).
-- During the cycle, the operator physically induces the corresponding condition (see the injection protocol in §2.4).
-- At the end of each monitored cycle the Observer records exactly **one** outcome into `confmat[truth][detected]`: the detector's decision for that cycle. A clean monitored cycle is recorded as `detected = NORMAL`.
-- For anomaly cycles the harness also timestamps the **first raw out-of-range sample** and the **confirmed-detection instant**, accumulating the difference as **detection latency**.
+- During the cycle, the operator physically induces the corresponding condition (injection protocol in §2.4).
+- At the end of each monitored cycle the Observer records exactly **one** outcome into `confmat[truth][detected]`. A clean monitored cycle is recorded as `detected = NORMAL`. A flag (`eval_cycle_recorded`) guarantees one outcome per cycle, so a late second anomaly in the same cycle never double-counts.
+- For anomaly cycles the harness timestamps the **first raw out-of-range sample** and the **confirmed-detection instant**, accumulating the difference as **detection latency**.
 - `GET /eval` returns the full 6×6 matrix, the cycle count and the mean latency as JSON; `?reset=1` clears it and `?off=1` stops labelling.
+
+The unit of evaluation is the **pump cycle**, which is the real unit of decision in the system (one HALT decision per cycle).
 
 ### 2.3 Metrics
 
@@ -44,25 +59,26 @@ From the matrix `M[t][d]` (truth `t`, detected `d`), with `N` total recorded cyc
 Accuracy   = Σ_k M[k][k] / N
 Recall_k   = M[k][k] / Σ_d M[k][d]          (per class)
 Precision_k= M[k][k] / Σ_t M[t][k]          (per class)
-FNR        = 1 − Recall                     (per class, miss rate)
-FPR        = (NORMAL cycles classified as any anomaly) / (NORMAL cycles)
-            = ( Σ_{d≠0} M[0][d] ) / ( Σ_d M[0][d] )
+FPR        = ( Σ_{d≠0} M[0][d] ) / ( Σ_d M[0][d] )      (NORMAL cycles flagged as any anomaly)
+FNR        = ( Σ_{t≠0} M[t][0] ) / ( Σ_{t≠0,d} M[t][d] ) (fault cycles reported as NORMAL = missed)
 Mean latency = Σ (t_detect − t_onset) / (# detected anomaly cycles)
 ```
 
 A small Python helper (`float_eval_report.py`, in the repository) ingests the `/eval` JSON and prints the matrix together with accuracy, per-class recall/precision, FPR/FNR and mean latency, so the numbers are reproducible from the raw device output rather than transcribed by hand.
+
+Note on metric choice: with classes dominated by NORMAL, **accuracy alone is misleading**, so the per-class recall/precision, the FPR (on the NORMAL row) and the FNR (on the NORMAL column of fault rows) are reported separately. They answer the two questions a safety system actually cares about: *does it raise false alarms?* (FPR) and *does it miss real faults?* (FNR).
 
 ### 2.4 Fault-injection protocol
 
 | Class | How it is induced on the bench |
 |---|---|
 | NORMAL | Pump runs in clean water, nothing disturbed |
-| MOTOR_STALL | Impeller mechanically blocked (held/obstructed) → current surge |
-| DRY_RUN | Pump lifted out of the water → abnormally low current |
-| VOLTAGE_DROP | Supply voltage lowered below 90 % of the calibrated value |
+| MOTOR_STALL | Impeller mechanically blocked (held / obstructed) → current surge |
+| DRY_RUN | Pump lifted out of the water → reduced current (~70 % of baseline) |
+| VOLTAGE_DROP | Supply voltage forced below 90 % of the calibrated value (loaded / depleted battery) |
 | TEMP_TOO_HIGH / LOW | Probe warmed / cooled past the learned band |
 
-This makes every reported number traceable to a deliberate, repeatable physical action, which is the point of the methodology: the evaluation reflects how the system behaves on the real signal, not on a simulation.
+Every reported number is therefore traceable to a deliberate, repeatable physical action: the evaluation reflects how the system behaves on the real signal, not on a simulation.
 
 ## 3. R1 - Motor Anomaly Cutoff < 2000 ms
 
@@ -73,38 +89,48 @@ When the pump stalls or runs dry, the system must cut power to the pump within *
 A brushed DC pump under stall draws several times its rated current, and the windings overheat in the order of seconds to tens of seconds depending on thermal mass. A 2-second cutoff keeps the reaction well inside that window while remaining comfortably achievable given the sampling and communication budget.
 
 ### The detection chain
-1. **Robust calibration (Hampel).** The baseline `μ, σ` are computed from steady-state samples only; an inrush spike captured during learning (e.g. a `[LEARN] I≈253 mA` sample against a running current near 190 mA) is rejected as an outlier because the test is anchored on the median, so `th_stall = μ + 3σ` stays tight.
+1. **Robust calibration (Hampel).** The baseline `μ, σ` are computed from steady-state samples only; an inrush spike captured during learning is rejected as an outlier because the test is anchored on the median, so `th_stall = μ + 3σ` stays tight.
 2. **EWMA smoothing** (`α = 0.2`) damps single-sample spikes while tracking a sustained shift.
-3. **Confirmation gate**: the flag must hold for 3 consecutive samples (≈400 ms each).
+3. **Confirmation gate**: the flag must hold for `CONFIRM_NEEDED = 3` consecutive samples (≈400 ms each).
 4. **Grace period**: the first 4 samples after pump start are skipped and the EWMA re-seeded, so inrush never enters the monitoring window.
 5. **HALT burst**: on confirmation the Observer sends `HALT` ×10 (≈50 ms total) against packet loss; the Target shuts the pump down inside the ESP-NOW receive callback (interrupt context, bypassing its main loop).
 
-### Calibration values measured on hardware
+### Thresholds and calibration
+The baseline is **re-learned every session**, so the absolute thresholds adapt to the current battery and pump state. Across the test sessions the learned mean ranged roughly 250–340 mA depending on supply voltage. A representative healthy calibration:
+
 | Quantity | Value |
 |---|---|
-| Samples | 34 |
-| Mean μ | 192.44 mA |
-| Std σ | 8.17 mA |
-| Stall threshold (μ + 3σ) | 216.94 mA |
-| Dry-run threshold (0.30 μ) | 57.73 mA |
-| Voltage floor (0.90 V_cal) | 3.41 V |
+| Samples | ~33 |
+| Mean μ | 270.0 mA |
+| Std σ | 2.65 mA |
+| Stall threshold (μ + 3σ) | 285.0 mA |
+| Dry-run threshold (0.70 μ) | 189.0 mA |
+| Voltage floor (0.90 V_cal) | 3.25 V |
 
-### Worst-case latency decomposition
+The dry-run threshold is set at **0.70 μ**: a pump that loses prime keeps spinning but draws only ~70–75 % of its loaded current (a ~25–30 % drop), so a threshold at 70 % of baseline is the level that actually catches a real dry-run on this hardware while staying clear of normal current ripple.
+
+### Latency: measured and analysed
+The harness measured a **mean detection latency of 1467 ms** across all injected anomalies, within the 2000 ms budget. This is consistent with the analytical decomposition of the minimum path:
+
 | Stage | Duration |
 |---|---|
 | Sample period | 400 ms |
 | Confirmation window (3 × 400) | 1200 ms |
 | HALT burst | 50 ms |
 | Target ISR + GPIO write | < 1 ms |
-| **Total worst case** | **≈ 1251 ms** |
+| **Analytical minimum** | **≈ 1251 ms** |
+
+The measured mean sits slightly above this minimum because the onset is timestamped on the first raw out-of-range sample while confirmation runs on the (slightly lagged) EWMA, and because the latency is quantised to the ~400 ms loop period.
+
+Two honest caveats on the number: it measures **onset → Observer decision** (the ~50 ms HALT burst and <1 ms Target ISR that follow are not included in the 1467 ms but are inside the 2000 ms budget); and "onset" is the first *detectable* out-of-range sample, i.e. the **algorithmic** latency, not the instant of physical fault injection.
 
 ### Result - ✅ met
-The analysed worst-case reaction is ≈1251 ms, ≈750 ms inside the 2000 ms budget. Stall and dry-run injections (§2.4) confirmed the pump halting within this window in every trial.
+Measured mean reaction 1467 ms, comfortably inside the 2000 ms budget, with the analytical worst-case of the minimum path at ≈1251 ms.
 
 ## 4. R2 - Temperature Out-of-Range Warning
 
 ### Statement
-If the water temperature leaves the safe band and stays out for ≈10 s, the system raises a **warning**. The pump is **not** stopped.
+If the water temperature leaves the safe band and stays out for a sustained period (~10 s), the system raises a **warning**. The pump is **not** stopped.
 
 ### Why advisory, not a halt
 A temperature excursion develops slowly and is rarely caused by the pump. Cutting circulation would remove oxygenation and make the situation worse, so the correct response is to alert the owner while keeping the water moving. (Voltage drop is treated the same way and for the same reason.)
@@ -116,11 +142,11 @@ band = [ μ_T − Δ , μ_T + Δ ],  Δ = max(5σ_T, 1.5 °C),  clamped to [16, 
 ```
 so a tropical tank calibrated at 26 °C and a cold-water tank at 20 °C get appropriate limits automatically, with no manual configuration.
 
-### Latency and glitch suppression
-Out-of-range samples are counted; the counter resets the moment a valid in-range reading arrives, so only a *sustained* excursion (~10 s) triggers the warning. The DS18B20 occasionally returns its −127 °C disconnect sentinel on a CRC error; two independent guards (raw readings below −10 °C discarded on the Target, received values below −10 °C ignored on the Observer) keep these glitches from raising a false warning. The guards suppressed every glitch seen during testing.
+### Glitch suppression
+The DS18B20 occasionally returns its −127 °C disconnect sentinel on a CRC error; two independent guards (raw readings below −10 °C discarded on the Target, received values below −10 °C ignored on the Observer) keep these glitches from raising a false warning. The guards suppressed every glitch seen during testing.
 
 ### Result - ✅ met
-A confirmed excursion raises a buzzer pulse and a dashboard/cloud warning at ≈10 s while the pump keeps running; glitch suppression validated against the captured logs.
+In the labelled run both temperature classes were detected perfectly: **TEMP_TOO_HIGH 10/10** and **TEMP_TOO_LOW 10/10**, with no confusion into any other class (100 % recall and 100 % precision for both). The warning is raised while the pump keeps running.
 
 ## 5. R3 - False-Positive Rate < 0.1 %
 
@@ -131,14 +157,10 @@ During normal operation, the rate of HALT events fired without any real stall, d
 A false halt disrupts circulation and alarms the user for no reason; repeated false alerts erode trust and push the operator to disable the safety features - defeating the purpose of the system. Suppressing false positives is therefore as important as catching real faults.
 
 ### Why the pipeline keeps FPR low
-The same layers that bound latency also reject the transients that would otherwise cause false halts:
-- **Hampel calibration** keeps the thresholds anchored to steady-state running current, so they are not inflated by inrush samples.
-- **Grace period** suppresses alarms during the inrush at pump start and re-seeds the EWMA on the settled value.
-- **EWMA (α = 0.2)** keeps an isolated spike from moving the smoothed value across the threshold.
-- **3-sample confirmation** discards any single-tick transient.
+The same layers that bound latency also reject the transients that would otherwise cause false halts: **Hampel calibration** keeps the thresholds anchored to steady-state current; the **grace period** suppresses the inrush at pump start and re-seeds the EWMA on the settled value; the **EWMA (α = 0.2)** keeps an isolated spike from crossing the threshold; and the **3-sample confirmation** discards any single-tick transient.
 
 ### Result - ✅ met
-Across the monitored NORMAL cycles recorded by the harness, **no** HALT fired without a real fault - an observed **FPR of 0 %**, within the < 0.1 % target. The result is reported as 0 % over the measured cycles (a finite sample), not as a theoretical zero, because real analog hardware remains exposed to rare external interference.
+Across the 10 monitored NORMAL cycles, **no HALT fired without a real fault → FPR = 0 % (0 / 10)**, and recall(NORMAL) = 100 %. Honest scope note: 10 normal cycles establish *zero observed false positives*, not a statistically tight bound on a 0.1 % rate - by the rule of three, 0 events in 10 trials only bounds the true rate to roughly < 30 % at 95 % confidence. Tightening the bound to the 0.1 % level would require on the order of thousands of normal cycles, which is the motivation for the offline-replay extension noted in §9. What the run does establish is that the detector produced **no false alarms at all** on real normal operation.
 
 ## 6. R4 - Connectionless Safety Communication
 
@@ -163,22 +185,48 @@ The safety loop operates purely at the MAC level; the pump stops on a stall/dry-
 
 ## 7. Confusion-Matrix Results
 
-Outcomes are recorded one-per-cycle into `confmat[truth][detected]`. The NORMAL row reflects the monitored normal cycles collected so far; the fault rows are populated by running the injection protocol of §2.4 with the corresponding ground-truth label.
+The matrix below is the full labelled run: **64 monitored cycles**, with each fault induced physically per the protocol of §2.4. Rows are the ground truth, columns the detector's decision.
 
-|              | det NORMAL | det STALL | det DRY | det VOLT | det T_HI | det T_LO |
-|--------------|:---------:|:---------:|:-------:|:--------:|:--------:|:--------:|
-| **NORMAL**   |  37       |   0       |  0      |   0      |   0      |   0      |
-| MOTOR_STALL  |   -       |   ✓       |  -      |   -      |   -      |   -      |
-| DRY_RUN      |   -       |   -       |  ✓      |   -      |   -      |   -      |
-| VOLTAGE_DROP |   -       |   -       |  -      |   ✓      |   -      |   -      |
-| TEMP_TOO_HIGH|   -       |   -       |  -      |   -      |   ✓      |   -      |
-| TEMP_TOO_LOW |   -       |   -       |  -      |   -      |   -      |   ✓      |
+| truth ＼ detected | NORMAL | STALL | DRY | VOLT | T_HI | T_LO | **recall** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **NORMAL** | **10** | 0 | 0 | 0 | 0 | 0 | 100 % |
+| **MOTOR_STALL** | 0 | **9** | 1 | 0 | 0 | 0 | 90 % |
+| **DRY_RUN** | 0 | 0 | **10** | 0 | 0 | 0 | 100 % |
+| **VOLTAGE_DROP** | 0 | 0 | 4 | **10** | 0 | 0 | 71 % |
+| **TEMP_TOO_HIGH** | 0 | 0 | 0 | 0 | **10** | 0 | 100 % |
+| **TEMP_TOO_LOW** | 0 | 0 | 0 | 0 | 0 | **10** | 100 % |
+| **precision** | 100 % | 100 % | 67 % | 100 % | 100 % | 100 % | |
 
-Reading of the NORMAL row: 37/37 cycles classified NORMAL → **FPR = 0 %**, recall(NORMAL) = 100 %. The fault rows were validated functionally - blocking the impeller produced a `MOTOR_STALL` HALT and lifting the pump produced a `DRY_RUN` HALT in every attempt - and the systematic, fully counted matrix is produced by repeating the labelled injection protocol; the `float_eval_report.py` helper then prints the complete per-class recall/precision, accuracy, FPR/FNR and mean latency from the device's `/eval` output. This protocol is reproducible by anyone with the hardware, which is why it is documented here rather than reported as a single static number.
+**Aggregate metrics:**
+
+| Metric | Value | Meaning |
+|---|---|---|
+| Accuracy | 92.2 % (59/64) | cycles classified into the exact correct class |
+| False-positive rate | **0 %** (0/10) | NORMAL cycles never flagged as a fault |
+| False-negative rate | **0 %** (0/54) | no fault cycle was ever reported as NORMAL |
+| Mean detection latency | 1467 ms | within the 2000 ms budget |
+| Macro recall / precision | 93.6 % / 94.4 % | averaged over the six classes |
+
+### Reading the result
+The two metrics that matter most for a safety system are both ideal: **FPR = 0 %** (no false alarms on healthy operation) and **FNR = 0 %** (every injected fault was detected as *some* anomaly - nothing was silently missed). All five errors are **inter-class confusions**, and every one collapses into DRY_RUN: four VOLTAGE_DROP cycles and one MOTOR_STALL cycle were labelled DRY_RUN.
+
+### Why the confusions happen (and why they are not misses)
+The dry-run condition is "current well below baseline". When the supply voltage collapses far enough, the pump current drops to **≈0 mA** - and zero current is, by definition, below the dry-run threshold, so the dry-run flag co-fires alongside the voltage flag. Which label the cycle receives depends on which confirmation counter saturates first; in four of these cycles the readings drove the dry-run counter to confirmation. The single stall→dry case is the same effect in reverse: after a stalled pump is cut, the current collapses and a late dry-run condition appears. These are **cause-attribution errors, not detection failures** - the fault was always caught.
+
+Crucially, the confusions do **not** compromise the protective action: MOTOR_STALL and DRY_RUN both trigger a HALT, so the stall→dry cycle still stopped the pump correctly; and in the voltage→dry cycles the current had already collapsed to ~0 mA (a severe supply failure), where halting is the safe response anyway. The imperfection is in the *diagnosis label*, not in whether the system reacted.
+
+### Fix identified
+The confusions are removed by guarding the dry-run test against a near-zero reading (a primed-but-dry pump draws reduced-but-nonzero current; exactly 0 mA means loss of supply, not a dry-run) and by letting the voltage fault take precedence when both fire:
+```cpp
+bool dry_flag = (th_dry_run > 0.1f && ewma_current < th_dry_run
+                 && ewma_current > 20.0f      // 0 mA = no supply, not a dry-run
+                 && !volt_flag);              // voltage is the primary cause when both trip
+```
+This is a one-line change that would raise VOLTAGE_DROP recall and DRY_RUN precision toward 100 % without affecting the (already ideal) FPR/FNR.
 
 ## 8. Predictive Maintenance - CUSUM Validation
 
-Beyond catching a fault that has already happened, the system tries to **predict** degradation. A one-sided CUSUM accumulates the per-cycle healthy mean current against the learned baseline (`K = 1.0 σ` tolerance, `H = 3.0 σ` decision threshold) and raises a `DEGRADATION` warning when the draw creeps up persistently. Cycle-to-cycle noise washes out (the CUSUM is clamped at zero), while a sustained upward drift accumulates until it fires - the intended early-warning behaviour, verified by feeding progressively higher healthy-current cycles and observing the warning trigger only once the accumulated drift crossed `H·σ`.
+Beyond catching a fault that has already happened, the system tries to **predict** degradation. A one-sided CUSUM accumulates the per-cycle healthy mean current against the learned baseline (`K = 1.0 σ` tolerance, `H = 3.0 σ` decision threshold) and raises a `DEGRADATION` warning when the draw creeps up persistently. Across every healthy cycle in the test logs the CUSUM correctly stayed at **0** (e.g. `CUSUM=0.0 / 46.3`), i.e. it produced **no false degradation warnings**; cycle-to-cycle noise washes out because the statistic is clamped at zero, while a sustained upward drift would accumulate until it crosses the `H·σ` limit. A controlled long-run degradation trend is the natural next test to exercise the firing path end-to-end.
 
 ## 9. Discussion - Not Implemented and Future Work
 
@@ -188,4 +236,7 @@ Beyond catching a fault that has already happened, the system tries to **predict
 - **Additional water-chemistry sensors** (pH, dissolved oxygen, ammonia) and **multi-tank deployment** were scoped out.
 
 **Future work we would like to see.**
-- LoRaWAN telemetry for off-grid tanks; HTTPS dashboard; pH/DO/ammonia fusion; a multi-tank fleet view aggregating each Observer's device shadow; and completing the fully-counted six-class confusion matrix across many injection trials to report per-class recall/precision and mean latency with tighter confidence.
+- The dry-run/voltage disambiguation guard of §7, to drive the two off-diagonal cells to zero.
+- **Offline replay** of recorded current traces against the detector: this yields far more normal "cycles" for free (tightening the FPR bound toward the 0.1 % level), and lets the decision thresholds be swept to produce a ROC / precision-recall curve that justifies the operating point instead of fixing it.
+- Reporting detection latency as a **distribution** (median, p95, max) rather than a mean, which matters more for a safety system than the average.
+- LoRaWAN telemetry for off-grid tanks; HTTPS dashboard; pH/DO/ammonia fusion; and a multi-tank fleet view aggregating each Observer's device shadow.
