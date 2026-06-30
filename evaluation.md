@@ -1,16 +1,5 @@
 # FLOAT - Evaluation Document (Final)
 
-**FLOAT - Framework for Local Observation of Aquatic Tanks**
-
-| | |
-|---|---|
-| **Team** | Michele Libriani (1954541) · Andrea Folino (1986019) · Edoardo Zompanti (1985499) |
-| **Course** | Internet of Things - Sapienza University of Rome |
-| **Repository** | `<INSERT GITHUB REPOSITORY LINK>` |
-| **Previous version (history)** | `<INSERT LINK TO MID-TERM EVALUATION DOCUMENT>` |
-
----
-
 ## 1. Requirements Overview
 
 Four requirements define the system's correctness and safety. Each is justified below from first principles and measured with the on-device evaluation harness of §2. The results column reports the figures obtained from a labelled run of 64 monitored cycles.
