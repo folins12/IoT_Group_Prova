@@ -1,0 +1,60 @@
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+
+const int TURBIDITY_PIN = A0;
+const int LED = 13;
+
+ISR(WDT_vect) { wdt_disable(); }
+
+void sleep4Seconds() {
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+  MCUSR &= ~(1 << WDRF);
+  WDTCSR |= (1 << WDCE) | (1 << WDE);
+  WDTCSR = (1 << WDP3);
+  WDTCSR |= _BV(WDIE);
+  ADCSRA &= ~(1 << ADEN);
+  sleep_cpu();
+  sleep_disable();
+  ADCSRA |= (1 << ADEN);
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED, OUTPUT);
+  for (int i = 0; i < 3; i++) { digitalWrite(LED, HIGH); delay(100); digitalWrite(LED, LOW); delay(100); }
+}
+
+void loop() {
+  unsigned long t0 = millis();
+  bool requested = false;
+  while (millis() - t0 < 150) {
+    if (Serial.available() > 0 && Serial.read() == 'T') { requested = true; break; }
+  }
+
+  if (requested) {
+    digitalWrite(LED, HIGH);
+
+    delay(20);
+    analogRead(TURBIDITY_PIN);
+    long sum = 0;
+    for (int i = 0; i < 10; i++) sum += analogRead(TURBIDITY_PIN);
+    int value = sum / 10;
+
+    Serial.println(value);
+    Serial.flush();
+
+    digitalWrite(LED, LOW);
+
+    unsigned long te = millis();
+    bool echo = false;
+    while (millis() - te < 600) {
+      if (Serial.available() > 0 && Serial.read() == 'E') { Serial.readStringUntil('\n'); echo = true; break; }
+    }
+    if (echo) { for (int i = 0; i < 2; i++) { digitalWrite(LED, HIGH); delay(40); digitalWrite(LED, LOW); delay(40); } }
+
+    while (Serial.available() > 0) Serial.read();
+  }
+
+  sleep4Seconds();
+}
