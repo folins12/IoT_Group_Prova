@@ -1,6 +1,4 @@
-// FLOAT - Target Node (ESP32-S3)
-// Turbidity + temperature sensing, pump + food servo, ESP-NOW link to the Observer.
-// Auto cycle: learn -> deep sleep -> (pump | feed) -> deep sleep. Manual bench in default-mode OFF.
+// FLOAT - Target Node 
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -13,16 +11,16 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// NVS-backed state (survives any reset)
+// NVS-backed state 
 Preferences prefs;
 bool autoCycleEnabled = true;
-volatile bool restart_requested = false;   // ESP.restart() done outside the RX callback
+volatile bool restart_requested = false;   
 
-// Manual controls (default-mode OFF only, RAM only)
+// Manual controls 
 volatile bool          manualPumpOn       = false;
-volatile unsigned long manualPumpOffAt    = 0;      // 0 = infinite
+volatile unsigned long manualPumpOffAt    = 0;      
 volatile bool          manualFeedNow      = false;
-volatile unsigned long feedIntervalMs     = 0;      // 0 = one-shot
+volatile unsigned long feedIntervalMs     = 0;      
 volatile unsigned long nextFeedAt         = 0;
 volatile bool          manualCalibrateReq = false;
 float                  lastTurbidityNtu   = -1.0f;
@@ -32,20 +30,20 @@ const int PUMP_PIN      = 47;
 const int SERVO_PIN     = 6;
 const int DS18B20_PIN   = 7;
 
-// Serial1 link to Arduino Uno (turbidity sensor): Uno TX->4, Uno RX->5
+// Link to Arduino Uno 
 const int TURB_RXD = 4;
 const int TURB_TXD = 5;
 
-// Turbidity calibration (raw ADC -> NTU)
+// Turbidity 
 const int   TURB_CLEAN_ADC     = 750;
 const int   TURB_DIRTY_ADC     = 10;
 const float TURB_MAX_NTU       = 800.0f;
 const float TURB_THRESHOLD_NTU = 50.0f;
 
-// Deep-sleep period
+// Deep-sleep 
 const uint64_t SLEEP_US = 20ULL * 1000000ULL;
 
-// RTC-persistent state (survives deep sleep)
+// RTC-persistent state 
 RTC_DATA_ATTR int      bootCount         = 0;
 RTC_DATA_ATTR bool     system_halted     = false;
 RTC_DATA_ATTR uint32_t last_cmd_id       = 0;
@@ -53,7 +51,7 @@ RTC_DATA_ATTR int      consecutive_noack = 0;
 RTC_DATA_ATTR int      anomaly_count     = 0;
 RTC_DATA_ATTR float    last_valid_temp   = 20.0f;
 
-// ESP-NOW peer (Observer MAC) + AES-CCM keys (must match observer.cpp byte-for-byte)
+// ESP-NOW + AES-CCM keys 
 uint8_t observerAddress[] = {0xF0, 0x9E, 0x9E, 0x77, 0x73, 0x60};
 static const uint8_t ESPNOW_PMK[16] = {'F','L','O','A','T','-','p','m','k','-','v','9','-','a','q','1'};
 static const uint8_t ESPNOW_LMK[16] = {'F','L','O','A','T','-','l','m','k','-','v','9','-','a','q','1'};
@@ -61,12 +59,12 @@ static const uint8_t ESPNOW_LMK[16] = {'F','L','O','A','T','-','l','m','k','-','
 volatile bool     emergency_stop = false;
 volatile bool     ack_received   = false;
 volatile uint32_t acked_id       = 0;
-const char*       haltCause      = nullptr;   // appended to the [HALT] message
+const char*       haltCause      = nullptr;   
 
 OneWire           oneWire(DS18B20_PIN);
 DallasTemperature tempSensor(&oneWire);
 
-// ESP-NOW receive callback (commands from the Observer)
+// ESP-NOW receive callback 
 void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     char msg[len + 1];
     memcpy(msg, data, len);
@@ -82,7 +80,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         manualPumpOffAt = 0;
         prefs.putBool("halted", true);
     } else if (s == "CMD:CLEAR_HALT") {
-        // Recover from a halt: manual -> clean idle; auto -> reboot into a fresh cycle.
         system_halted   = false;
         emergency_stop  = false;
         anomaly_count   = 0;
@@ -127,13 +124,11 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         manualPumpOffAt = 0;
         digitalWrite(PUMP_PIN, LOW);
     } else if (s == "CMD:FEED_STOP") {
-        // Cancel a scheduled (repeating) feed. Checked BEFORE the CMD:FEED prefix.
         manualFeedNow  = false;
         feedIntervalMs = 0;
         nextFeedAt     = 0;
         Serial.println("[TGT] Feeding stopped");
     } else if (s.startsWith("CMD:FEED")) {
-        // CMD:FEED or CMD:FEED:N (N = repeat interval s; 0/absent = once)
         long sec = 0;
         int  c   = s.indexOf(':', 4);
         if (c != -1) sec = s.substring(c + 1).toInt();
@@ -148,7 +143,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             Serial.println("[TGT] Default mode -> ON");
         }
     } else if (s == "CMD:AUTO_ON_RESET") {
-        // OFF->ON: bootCount=0 + software restart -> fresh learning. Guarded against duplicates.
         if (!autoCycleEnabled && !restart_requested) {
             autoCycleEnabled  = true;
             bootCount         = 0;
@@ -171,7 +165,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             Serial.println("[TGT] Default mode -> ON + RESET (restart pending)");
         }
     } else if (s == "CMD:AUTO_ON_KEEP") {
-        // OFF->ON keeping a manual calibration: start at bootCount=1 (skip learning).
         if (!autoCycleEnabled && !restart_requested) {
             autoCycleEnabled  = true;
             bootCount         = 1;
@@ -197,7 +190,6 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         acked_id     = (uint32_t)s.substring(4).toInt();
         ack_received = true;
     } else if (s.startsWith("CAL:")) {
-        // CAL:mean,std,th_stall,th_dry,th_temp_high,th_temp_low (log only)
         String p  = s.substring(4);
         int c1 = p.indexOf(','), c2 = p.indexOf(',', c1+1);
         int c3 = p.indexOf(',', c2+1), c4 = p.indexOf(',', c3+1);
@@ -212,14 +204,14 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 }
 
-// Fire-and-forget message (telemetry, logs)
+// Fire-and-forget message 
 void sendMsg(const String& type, const String& content) {
     String full = type + ":" + content;
     esp_now_send(observerAddress, (const uint8_t*)full.c_str(), full.length());
     delay(150);
 }
 
-// Critical message with retry + ACK ("|ID:N" appended; Observer replies "ACK:N")
+// Critical message with retry + ACK
 bool sendMsgWithACK(const String& type, const String& content,
                     int retries = 5, int timeout_ms = 300) {
     last_cmd_id++;
@@ -237,7 +229,7 @@ bool sendMsgWithACK(const String& type, const String& content,
             }
             delay(10);
         }
-        delay(50 * (attempt + 1));  // exponential backoff
+        delay(50 * (attempt + 1));  
     }
 
     consecutive_noack++;
@@ -246,14 +238,13 @@ bool sendMsgWithACK(const String& type, const String& content,
     return false;
 }
 
-// Turbidity over Serial1 ('T'/'E' handshake). Run before WiFi (lower RF noise on the Uno ADC).
-// Returns NTU, or 0.0 (safe clean default) on timeout. +-0.5%/C viscosity correction.
+// Turbidity 
 const unsigned long MAX_TURB_WAIT_MS = 4500;
 
 float readTurbidityFromArduino(float temp_c = 25.0f) {
     Serial1.begin(9600, SERIAL_8N1, TURB_RXD, TURB_TXD);
     delay(100);
-    sendMsg("LOG", "[TGT] inizio lettura torbidita' - mando 'T'");
+    sendMsg("LOG", "[TGT] Starting reading turbidity - sent 'T'");
     int   raw_adc   = 0;
     bool  got_value = false;
     unsigned long search_start = millis();
@@ -298,7 +289,7 @@ float readTurbidityFromArduino(float temp_c = 25.0f) {
     return constrain(ntu_raw / correction, 0.0f, TURB_MAX_NTU);
 }
 
-// Servo: software PWM
+// Servo
 void servoMove(int us, int pulses) {
     for (int i = 0; i < pulses; i++) {
         digitalWrite(SERVO_PIN, HIGH);
@@ -308,7 +299,7 @@ void servoMove(int us, int pulses) {
     }
 }
 
-// Single deep-sleep entry point
+// Deep-sleep 
 void goToSleep(uint64_t duration_us = SLEEP_US) {
     bootCount++;
     sendMsg("LOG", "[SLEEP] Deep sleep " +
@@ -319,7 +310,7 @@ void goToSleep(uint64_t duration_us = SLEEP_US) {
     esp_deep_sleep_start();
 }
 
-// Validate DS18B20 reading (-127 = disconnected)
+// Temperature 
 float safeTemp(float raw) {
     if (raw == DEVICE_DISCONNECTED_C || raw < -10.0f) {
         Serial.printf("[WARN] Invalid temperature %.1f C - using last valid: %.1f C\n", raw, last_valid_temp);
@@ -329,7 +320,7 @@ float safeTemp(float raw) {
     return raw;
 }
 
-// WiFi: scan for the Observer's SSID and pin ESP-NOW to its channel (must match observer.cpp)
+// WiFi
 const char* WIFI_SSID = "Pixel_3478";
 
 uint8_t findChannel() {
@@ -352,7 +343,7 @@ uint8_t findChannel() {
 }
 
 void setup() {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // disable brown-out detector
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   
 
     Serial.begin(115200);
     pinMode(PUMP_PIN,  OUTPUT);
@@ -362,13 +353,10 @@ void setup() {
     digitalWrite(PUMP_PIN,  LOW);
     digitalWrite(SERVO_PIN, LOW);
 
-    // Load persisted state (NVS is the source of truth for halted / default-mode)
     prefs.begin("float", false);
     if (!system_halted) system_halted = prefs.getBool("halted", false);
     autoCycleEnabled = prefs.getBool("auto", true);
 
-    // Pump-load reset storm: only resets that happen WHILE the pump drives load
-    // (NVS "pumping" marker) count toward a safety halt. Idle/sleep brownouts are ignored.
     if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
         bool wasPumping = prefs.getBool("pumping", false);
         prefs.putBool("pumping", false);
@@ -421,7 +409,7 @@ void setup() {
         esp_now_peer_info_t peer;
         memset(&peer, 0, sizeof(peer));
         memcpy(peer.peer_addr, observerAddress, 6);
-        peer.channel = 0;                 // use current radio channel
+        peer.channel = 0;                 
         memcpy(peer.lmk, ESPNOW_LMK, 16);
         peer.encrypt = true;
         esp_now_add_peer(&peer);
@@ -432,7 +420,7 @@ void setup() {
 
     delay(2000);
 
-    // Initial data to the Observer
+    // Initial data 
     sendMsg("LOG", "------------------------------------");
     sendMsg("LOG", "[BOOT] #" + String(bootCount));
     sendMsg("LOG", "[SENSOR] Turbidity : " + String(turbidity_ntu, 1) +
@@ -454,7 +442,7 @@ void setup() {
         goToSleep(60ULL * 1000000ULL);
     }
 
-    // Grace window: let the Observer piggy-back HALT / AUTO_* before we decide
+    // Grace window
     delay(800);
 
     if (restart_requested) {
@@ -464,7 +452,7 @@ void setup() {
         ESP.restart();
     }
 
-    // Halted: stay awake in BOTH modes so the dashboard shows HALTED and Clear HALT reaches us
+    // System halted
     if (system_halted) {
         String hmsg = "[HALT] Halted - pump locked. Press 'Clear HALT' on the dashboard to recover.";
         if (haltCause) hmsg += String("  (cause: ") + haltCause + ")";
@@ -472,7 +460,7 @@ void setup() {
         return;
     }
 
-    // Default mode OFF: stay awake, loop() runs the manual bench
+    // Default mode OFF
     if (!autoCycleEnabled) {
         sendMsg("LOG", "[IDLE] Default mode OFF - staying awake, no boots until toggled ON");
         return;
@@ -480,13 +468,11 @@ void setup() {
 
     // ===== MAIN AUTO CYCLE =====
 
-    // Safety latch: persist halted=true BEFORE any pump activation; cleared only on a clean cycle.
     prefs.putBool("halted", true);
-    // Pump-load marker: a reset between here and the end-of-cycle clear is attributed to pump load.
     prefs.putBool("pumping", true);
 
     if (bootCount == 0) {
-        // Learning phase
+        // Learning
         sendMsg("LOG", "[ACTION] First boot -> calibration learning phase");
 
         bool ok = sendMsgWithACK("CMD", "START_LEARN");
@@ -501,8 +487,7 @@ void setup() {
                 last_update = millis();
                 tempSensor.requestTemperatures();
                 float live_temp = safeTemp(tempSensor.getTempCByIndex(0));
-                sendMsg("DATA", "SENSOR:" + String(turbidity_ntu, 1) +
-                        "," + String(live_temp, 1));
+                sendMsg("DATA", "SENSOR:" + String(turbidity_ntu, 1) + "," + String(live_temp, 1));
             }
             delay(10);
         }
@@ -510,9 +495,7 @@ void setup() {
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
     } else if (turbidity_ntu <= TURB_THRESHOLD_NTU) {
-        // Below threshold -> pump 10 s with monitoring
-        sendMsg("LOG", "[ACTION] Turbidity=" + String(turbidity_ntu, 1) +
-                " NTU -> pump ON (10 s)");
+        sendMsg("LOG", "[ACTION] Turbidity=" + String(turbidity_ntu, 1) + " NTU -> pump ON (10 s)");
 
         bool ok = sendMsgWithACK("CMD", "START_MONITOR");
         if (!ok) sendMsg("LOG", "[WARN] Observer did not confirm START_MONITOR");
@@ -535,7 +518,6 @@ void setup() {
         sendMsgWithACK("CMD", "STOP_MEASURE");
 
     } else if (turbidity_ntu >  TURB_THRESHOLD_NTU) {
-        // Above threshold -> feed (servo) + short 5 s pump
         sendMsg("LOG", "[ACTION] Water clean (" + String(turbidity_ntu, 1) + " NTU) -> feed + short pump");
 
         sendMsg("LOG", "[SERVO] Open - dispensing");
@@ -569,11 +551,11 @@ void setup() {
     }
 
     // End of cycle
-    prefs.putBool("pumping", false);   // pump off -> a later sleep/idle reset is a harmless glitch
+    prefs.putBool("pumping", false);   
     delay(500);
     if (!emergency_stop && !system_halted) {
         prefs.putBool("halted", false);
-        prefs.putInt("storm", 0);      // clean cycle -> not in a stall loop
+        prefs.putInt("storm", 0);     
     } else {
         sendMsg("LOG", "[LATCH] Anomaly during cycle - halted state persisted");
     }
@@ -600,7 +582,7 @@ void setup() {
     goToSleep();
 }
 
-// One servo open/close
+// Servo open/close
 void doFeed() {
     sendMsg("LOG", "[MANUAL] Feed - servo open");
     servoMove(1500, 35);
@@ -609,7 +591,7 @@ void doFeed() {
     sendMsg("LOG", "[MANUAL] Feed - servo closed");
 }
 
-// Manual calibration from idle (reuses the Observer LEARNING path; does not touch the pump)
+// Manual calibration
 void runManualCalibration() {
     sendMsg("LOG", String("[MANUAL] Calibration start (pump ") +
             (manualPumpOn ? "ON" : "OFF - baseline will be idle, thresholds invalid!") + ")");
@@ -633,8 +615,7 @@ void runManualCalibration() {
     sendMsg("LOG", "[MANUAL] Calibration done - thresholds updated on Observer");
 }
 
-// loop(): reached only in default-mode OFF (manual bench). Services pump timer,
-// food scheduler, calibration requests; sends a heartbeat for OFF->ON reconciliation.
+// loop() - default-mode OFF
 void loop() {
     if (restart_requested) {
         Serial.println("[TGT] Restart requested - rebooting for fresh state");
@@ -645,7 +626,7 @@ void loop() {
 
     unsigned long now = millis();
 
-    // Manual pump -> keep the Observer in MONITORING (stall/dry-run stay active)
+    // Manual pump 
     static bool monitorActive = false;
     static unsigned long last_stream = 0;
     if (manualPumpOn && !monitorActive) {
@@ -670,14 +651,14 @@ void loop() {
         sendMsg("LOG", "[MANUAL] Pump duration elapsed - OFF");
     }
 
-    // Calibration request (runs outside the RX callback)
+    // Calibration request 
     if (manualCalibrateReq) {
         manualCalibrateReq = false;
         runManualCalibration();
         monitorActive = false;
     }
 
-    // Food: immediate feed, then repeat at the interval if set
+    // Food
     if (manualFeedNow) {
         manualFeedNow = false;
         doFeed();
@@ -687,7 +668,7 @@ void loop() {
         nextFeedAt = millis() + feedIntervalMs;
     }
 
-    // Heartbeat "HB:<pump><halt>" every 2 s
+    // Heartbeat
     static unsigned long last_hb = 0;
     if (now - last_hb >= 2000) {
         last_hb = now;

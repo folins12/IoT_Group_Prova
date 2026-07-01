@@ -1,12 +1,6 @@
 #ifndef DASHBOARD_H
 #define DASHBOARD_H
 
-// Static dashboard served by the Observer over WiFi. Polls /data + /events.
-// Live current chart (raw + EWMA + stall/dry-run threshold lines), sensor cards,
-// default-mode toggle, manual controls (OFF mode only) and HALT recovery.
-// Developer-only evaluation panel (confusion matrix) shown when the URL has ?dev.
-// Chart.js is loaded from CDN (the hotspot has internet).
-
 const char* html_page = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -526,8 +520,7 @@ function renderEval(d){
   const st=document.getElementById('eval-stats');
   const cur=(d.truth>=0)?('Active truth: <b>'+EVAL_LABELS[d.truth]+'</b>'):'Labelling off';
   st.innerHTML=cur+' &middot; samples: <b>'+d.count+'</b> &middot; accuracy: <b>'+acc.toFixed(0)+
-    '%</b> &middot; false positives: <b>'+fpr.toFixed(0)+'%</b> &middot; false negatives: <b>'+fnr.toFixed(0)+
-    '%</b> &middot; mean latency: <b>'+d.lat+' ms</b>';
+    '%</b> &middot; false positives: <b>'+fpr.toFixed(0)+'%</b> &middot; false negatives: <b>'+fnr.toFixed(0);
   let h='<tr><th>truth / det</th>';
   for(let j=0;j<T;j++) h+='<th>'+EVAL_SHORT[j]+'</th>';
   h+='</tr>';
