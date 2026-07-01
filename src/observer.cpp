@@ -1,7 +1,14 @@
 // FLOAT - Observer Node (ESP32)
-// Measures the Target's supply current with an INA219, detects anomalies (EWMA + Hampel),
+// Measures the Target's supply current with an INA219, detects anomalies (SPC: Shewhart + CUSUM),
 // serves the local dashboard, and bridges to the cloud over MQTT + email alerts.
 // Anomaly policy: MOTOR_STALL / DRY_RUN -> halt; VOLTAGE_DROP / TEMP_TOO_HIGH/LOW -> warning only.
+//
+// Detection design (Statistical Process Control):
+//   MOTOR_STALL  : upper Shewhart control limit  mu + 3*sigma          (large, abrupt jump)
+//   DRY_RUN      : lower one-sided CUSUM on pump current               (sustained under-current)
+//   DEGRADATION  : cumulative CUSUM on per-cycle healthy mean          (slow drift, predictive)
+//   TEMP high/low: adaptive control band  mu_T +/- max(5*sigma_T,1.5)  (learned per tank)
+//   VOLTAGE_DROP : PHYSICAL battery cutoff  (NOT a statistical limit: voltage drifts with SoC)
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -131,9 +138,9 @@ int        grace_period    = 0;
 
 float baseline_mean      = 0.0f;
 float baseline_std       = 0.0f;
-float th_stall           = 0.0f;   // mu + 3*sigma
-float th_volt_min        = 0.0f;   // 90% of calibration voltage
-float th_dry_run         = 0.0f;   // 30% of mu
+float th_stall           = 0.0f;   // mu + 3*sigma (upper Shewhart limit)
+float th_volt_min        = 0.0f;   // physical battery cutoff OR 90% of cal voltage
+float th_dry_run         = 0.0f;   // lower control-limit reference (display/onset); detection via lower CUSUM
 bool  is_calibrated      = false;
 bool  calFromManual      = false;
 bool  new_temp_for_learn = false;
@@ -164,6 +171,19 @@ const float DRIFT_H_SIGMA = 3.0f;   // fire after this many sigma accumulate
 float drift_cusum     = 0.0f;
 float drift_cycle_sum = 0.0f;
 int   drift_cycle_n   = 0;
+
+// Dry-run: within-cycle LOWER CUSUM on pump current (sustained under-current, NOT an on/off switch).
+// K and H are floored to a fraction of baseline because steady-state sigma is tiny while a dry
+// pump drops current by a fraction of its LOADED value.
+const float DRY_K_SIGMA     = 0.5f;    // CUSUM slack (sigma)
+const float DRY_H_SIGMA     = 5.0f;    // CUSUM decision (sigma)
+const float DRY_K_FRAC      = 0.10f;   // ... or >= 10% of baseline
+const float DRY_H_FRAC      = 0.20f;   // ... or >= 20% of baseline
+const float DRY_MIN_CURRENT = 20.0f;   // below this = no supply, NOT a dry-run
+float dry_cusum = 0.0f;                // lower-CUSUM accumulator (reset each monitoring cycle)
+
+// Voltage: PHYSICAL battery cutoff, not a statistical control limit (voltage drifts with state of charge).
+const float BATT_CUTOFF_V = 3.30f;     // LiPo safe cutoff under load
 
 // Evaluation harness: labelled confusion matrix + detection latency.
 // Classes: 0 NORMAL, 1 MOTOR_STALL, 2 DRY_RUN, 3 VOLTAGE_DROP, 4 TEMP_TOO_HIGH, 5 TEMP_TOO_LOW.
@@ -521,6 +541,7 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
         temp_confirm  = 0;
         ewma_init       = false;
         grace_period    = 4;
+        dry_cusum           = 0.0f;   // reset the lower CUSUM for this monitoring cycle
         eval_cycle_recorded = false;
         eval_onset_ms       = 0;
         Serial.println("[OBS] MODE -> MONITORING");
@@ -535,8 +556,10 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             baseline_std  = clean_std;
             th_stall      = baseline_mean + (3.0f * baseline_std);
             if (th_stall < baseline_mean + 15.0f) th_stall = baseline_mean + 15.0f;
-            th_volt_min   = last_voltage * 0.90f;
-            th_dry_run    = baseline_mean * 0.85f;
+            // Voltage: physical battery cutoff OR 10% below the calibration voltage (whichever is higher)
+            th_volt_min   = max(BATT_CUTOFF_V, last_voltage * 0.90f);
+            // Dry-run reference (lower control limit): mu - max(3 sigma, 15% of mu). Detection is the lower CUSUM.
+            th_dry_run    = baseline_mean - max(3.0f * baseline_std, 0.15f * baseline_mean);
 
             if (temp_sample_idx >= 3) {
                 float temp_mean, temp_std;
@@ -562,12 +585,12 @@ void OnDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
             is_calibrated = true;
             drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
 
-            Serial.println("\n[OBS] == Calibration complete (EWMA + Hampel) ==");
+            Serial.println("\n[OBS] == Calibration complete (SPC: Shewhart + CUSUM) ==");
             Serial.printf("   mean (mu)  : %.2f mA\n",          baseline_mean);
             Serial.printf("   std (sigma): %.2f mA\n",          baseline_std);
             Serial.printf("   Stall thr  : %.2f mA  (mu+3sigma)\n", th_stall);
-            Serial.printf("   Dry-run    : %.2f mA  (85%% mu)\n",  th_dry_run);
-            Serial.printf("   Volt min   : %.2f V\n",            th_volt_min);
+            Serial.printf("   Dry-run ref: %.2f mA  (lower ctrl limit; CUSUM detect)\n", th_dry_run);
+            Serial.printf("   Volt min   : %.2f V   (battery cutoff)\n", th_volt_min);
 
             char buf[200];
             snprintf(buf, sizeof(buf), "CAL:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
@@ -793,6 +816,7 @@ void applyMode(bool on) {
         calFromManual     = false;
         th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;
         drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
+        dry_cusum = 0.0f;
         pendingTargetCmd   = "CMD:AUTO_ON_RESET";
         pendingTargetCount = 5;
         push_event("phase", "Default mode ON - fresh learning starting");
@@ -809,6 +833,7 @@ void applyMode(bool on) {
         last_anomaly_pushed = "NONE";
         th_stall = th_dry_run = th_temp_high = th_temp_low = 0.0f;
         drift_cusum = 0.0f; drift_cycle_sum = 0.0f; drift_cycle_n = 0;
+        dry_cusum = 0.0f;
         pendingTargetCmd   = "CMD:AUTO_OFF";
         pendingTargetCount = 5;
         push_event("phase", "Default mode OFF - system paused, calibration cleared");
@@ -971,7 +996,7 @@ void setup() {
     push_event("phase", "IDLE - system online");
 
     Serial.println("\n== FLOAT Observer Node ==");
-    Serial.println("EWMA+Hampel | DRY_RUN | dynamic TEMP | VOLT/TEMP = warning only");
+    Serial.println("SPC: Shewhart(stall) + lower CUSUM(dry) + CUSUM(degrade) | adaptive TEMP | battery cutoff(volt) | VOLT/TEMP = warning");
 }
 
 void loop() {
@@ -1049,7 +1074,7 @@ void loop() {
         return;
     }
 
-    // MONITORING: detect anomalies on EWMA + confirmation counters
+    // MONITORING: detect anomalies (SPC) + confirmation counters
     if (current_mode == "MONITORING" && is_calibrated) {
         if (grace_period > 0) {
             grace_period--;
@@ -1057,16 +1082,34 @@ void loop() {
                           grace_period, last_current);
             if (grace_period == 0) {
                 ewma_current = last_current;
+                dry_cusum    = 0.0f;   // start the lower CUSUM clean once the motor has settled
                 Serial.printf("   [MON] Grace period ended - EWMA seeded at %.1f mA\n", ewma_current);
             }
             smartDelay(400);
             return;
         }
 
-        bool stall_flag     = (ewma_current > th_stall);
-        bool volt_flag      = (th_volt_min > 0.1f && last_voltage < th_volt_min);
-        bool dry_flag       = (th_dry_run  > 0.1f && ewma_current < th_dry_run);
+        // MOTOR_STALL: upper Shewhart control limit (large abrupt jump).
+        bool stall_flag = (ewma_current > th_stall);
 
+        // VOLTAGE_DROP: physical battery cutoff (voltage is not a stationary process).
+        bool volt_flag  = (th_volt_min > 0.1f && last_voltage < th_volt_min);
+
+        // DRY_RUN: lower one-sided CUSUM on the raw pump current (sustained under-current).
+        // K/H are floored to a fraction of the baseline (steady-state sigma is tiny).
+        // A supply collapse (current ~0) or an active voltage fault is NOT a dry-run:
+        // it is excluded here and handled by the voltage branch.
+        float dryK = max(DRY_K_SIGMA * baseline_std, DRY_K_FRAC * baseline_mean);
+        float dryH = max(DRY_H_SIGMA * baseline_std, DRY_H_FRAC * baseline_mean);
+        if (last_current > DRY_MIN_CURRENT) {
+            dry_cusum += (baseline_mean - dryK) - last_current;   // grows as current sags below (mu - K)
+            if (dry_cusum < 0.0f) dry_cusum = 0.0f;
+        } else {
+            dry_cusum = 0.0f;                                     // no supply -> not a dry-run
+        }
+        bool dry_flag = (dry_cusum > dryH) && !volt_flag;
+
+        // TEMP: adaptive control band.
         bool temp_high_flag = false;
         bool temp_low_flag  = false;
         if (last_temp_c != -127.0f && last_temp_c > -10.0f) {
@@ -1078,7 +1121,7 @@ void loop() {
         // Evaluation: timestamp first raw out-of-range sample (for latency)
         if (eval_truth >= 0 && eval_onset_ms == 0) {
             bool raw_bad = (last_current > th_stall) ||
-                           (th_dry_run  > 0.1f && last_current < th_dry_run) ||
+                           (last_current > DRY_MIN_CURRENT && last_current < th_dry_run) ||
                            (th_volt_min > 0.1f && last_voltage < th_volt_min) ||
                            temp_flag;
             if (raw_bad) eval_onset_ms = (uint32_t)millis();
@@ -1086,7 +1129,7 @@ void loop() {
 
         if (stall_flag) stall_confirm++; else stall_confirm = 0;
         if (volt_flag)  volt_confirm++;  else volt_confirm = 0;
-        if (dry_flag)   dry_confirm++;   else dry_confirm = 0;
+        dry_confirm = dry_flag ? CONFIRM_NEEDED : 0;   // CUSUM crossing IS the confirmation
         if (temp_flag)  temp_confirm++;  else temp_confirm = 0;
 
         // Degradation: accumulate only healthy samples
@@ -1101,9 +1144,9 @@ void loop() {
                        (temp_confirm >= CONFIRM_NEEDED);
 
         Serial.printf("   [MON] I_raw=%.1f  I_ewma=%.1f  V=%.2f  T=%.1f"
-                      "  thr[H%.1f L%.1f]  [S:%d V:%d D:%d T:%d]%s%s%s%s%s\n",
+                      "  Tthr[H%.1f L%.1f]  dryCUSUM=%.0f/%.0f  [S:%d V:%d D:%d T:%d]%s%s%s%s%s\n",
                       last_current, ewma_current, last_voltage, last_temp_c,
-                      th_temp_high, th_temp_low,
+                      th_temp_high, th_temp_low, dry_cusum, dryH,
                       stall_confirm, volt_confirm, dry_confirm, temp_confirm,
                       stall_flag      ? " STALL"     : "",
                       volt_flag       ? " VOLT-LOW"  : "",
